@@ -1,10 +1,40 @@
 use serde::Deserialize;
 use std::process::Command;
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
+use std::sync::Arc;
+
+#[derive(Debug, Default)]
+pub struct RateLimitState {
+    pub limit: AtomicU32,
+    pub remaining: AtomicU32,
+    pub reset_epoch: AtomicI64,
+}
+
+impl RateLimitState {
+    pub fn update_from_headers(&self, headers: &reqwest::header::HeaderMap) {
+        if let Some(val) = headers.get("x-ratelimit-limit").and_then(|v| v.to_str().ok()) {
+            if let Ok(num) = val.parse::<u32>() {
+                self.limit.store(num, Ordering::Relaxed);
+            }
+        }
+        if let Some(val) = headers.get("x-ratelimit-remaining").and_then(|v| v.to_str().ok()) {
+            if let Ok(num) = val.parse::<u32>() {
+                self.remaining.store(num, Ordering::Relaxed);
+            }
+        }
+        if let Some(val) = headers.get("x-ratelimit-reset").and_then(|v| v.to_str().ok()) {
+            if let Ok(epoch) = val.parse::<i64>() {
+                self.reset_epoch.store(epoch, Ordering::Relaxed);
+            }
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
     client: reqwest::Client,
     pub token: Option<String>,
+    pub rate_limit: Arc<RateLimitState>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -21,7 +51,16 @@ pub struct UserInfo {
 #[derive(Debug, Clone, Deserialize)]
 pub struct OrgItem {
     pub login: String,
+    pub name: Option<String>,
     pub description: Option<String>,
+    pub location: Option<String>,
+    pub blog: Option<String>,
+    pub public_repos: Option<u64>,
+    pub followers: Option<u64>,
+    pub created_at: Option<String>,
+    pub html_url: Option<String>,
+    #[serde(default)]
+    pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,44 +150,122 @@ impl GitHubClient {
             .build()
             .unwrap_or_default();
 
-        Self { client, token }
+        let rate_limit = Arc::new(RateLimitState {
+            limit: AtomicU32::new(if token.is_some() { 5000 } else { 60 }),
+            remaining: AtomicU32::new(if token.is_some() { 5000 } else { 60 }),
+            reset_epoch: AtomicI64::new(0),
+        });
+
+        Self { client, token, rate_limit }
     }
 
-    pub async fn get_current_user(&self) -> Result<UserInfo, reqwest::Error> {
-        let res = self.client.get("https://api.github.com/user").send().await?;
-        res.error_for_status()?.json::<UserInfo>().await
+    pub fn is_authenticated(&self) -> bool {
+        self.token.is_some()
     }
 
-    pub async fn get_user_profile(&self, username: &str) -> Result<UserInfo, reqwest::Error> {
+    pub async fn get_current_user(&self) -> Result<UserInfo, String> {
+        let res = self.client.get("https://api.github.com/user").send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        res.json::<UserInfo>().await.map_err(|e| e.to_string())
+    }
+
+    pub async fn get_user_profile(&self, username: &str) -> Result<UserInfo, String> {
         let url = format!("https://api.github.com/users/{}", username);
-        let res = self.client.get(&url).send().await?;
-        res.error_for_status()?.json::<UserInfo>().await
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        res.json::<UserInfo>().await.map_err(|e| e.to_string())
     }
 
-    pub async fn get_user_orgs(&self) -> Result<Vec<OrgItem>, reqwest::Error> {
+    pub async fn get_org_profile(&self, org: &str) -> Result<OrgItem, String> {
+        let url = format!("https://api.github.com/orgs/{}", org);
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        let mut org_item = res.json::<OrgItem>().await.map_err(|e| e.to_string())?;
+
+        // If authenticated, check membership role
+        if self.token.is_some() {
+            let member_url = format!("https://api.github.com/user/memberships/orgs/{}", org);
+            if let Ok(mres) = self.client.get(&member_url).send().await {
+                if let Ok(val) = mres.json::<serde_json::Value>().await {
+                    if let Some(r) = val.get("role").and_then(|v| v.as_str()) {
+                        org_item.role = Some(r.to_string());
+                    }
+                }
+            }
+        }
+
+        Ok(org_item)
+    }
+
+    pub async fn get_user_orgs(&self) -> Result<Vec<OrgItem>, String> {
         let res = self
             .client
             .get("https://api.github.com/user/orgs?per_page=100")
             .send()
-            .await?;
-        res.error_for_status()?.json::<Vec<OrgItem>>().await
+            .await
+            .map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        res.json::<Vec<OrgItem>>().await.map_err(|e| e.to_string())
     }
 
-    pub async fn search_users(&self, query: &str) -> Result<Vec<SearchUserItem>, reqwest::Error> {
+    pub async fn search_users(&self, query: &str) -> Result<Vec<SearchUserItem>, String> {
         let url = format!(
             "https://api.github.com/search/users?q={}&per_page=10",
             urlencoding(query)
         );
-        let res = self.client.get(&url).send().await?;
-        let resp = res.error_for_status()?.json::<SearchUsersResponse>().await?;
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        let resp = res.json::<SearchUsersResponse>().await.map_err(|e| e.to_string())?;
         Ok(resp.items)
+    }
+
+    // Helper for auto-paginating up to max_items (1,000) using RFC 5988 Link headers
+    async fn paginate_repos(&self, initial_url: String, max_items: usize) -> Result<Vec<RepoItem>, String> {
+        let mut all_repos = Vec::new();
+        let mut next_url = Some(initial_url);
+
+        while let Some(url) = next_url {
+            let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+            self.rate_limit.update_from_headers(res.headers());
+            let link_header = res.headers().get("link").and_then(|h| h.to_str().ok()).map(|s| s.to_string());
+
+            let res = res.error_for_status().map_err(|e| {
+                if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                    "Repositories not found or access denied.".to_string()
+                } else if e.status() == Some(reqwest::StatusCode::FORBIDDEN) {
+                    "Rate limit exceeded or SSO forbidden.".to_string()
+                } else {
+                    e.to_string()
+                }
+            })?;
+
+            let page_repos = res.json::<Vec<RepoItem>>().await.map_err(|e| e.to_string())?;
+            if page_repos.is_empty() {
+                break;
+            }
+            all_repos.extend(page_repos);
+
+            if all_repos.len() >= max_items {
+                all_repos.truncate(max_items);
+                break;
+            }
+
+            next_url = link_header.as_deref().and_then(parse_next_link);
+        }
+
+        Ok(all_repos)
     }
 
     pub async fn get_repos_for_user(
         &self,
         username: &str,
         is_authenticated_user: bool,
-    ) -> Result<Vec<RepoItem>, reqwest::Error> {
+    ) -> Result<Vec<RepoItem>, String> {
         let url = if is_authenticated_user {
             "https://api.github.com/user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator".to_string()
         } else {
@@ -157,30 +274,29 @@ impl GitHubClient {
                 username
             )
         };
-        let res = self.client.get(&url).send().await?;
-        let repos = res.error_for_status()?.json::<Vec<RepoItem>>().await?;
-        Ok(repos)
+        self.paginate_repos(url, 1000).await
     }
 
-    pub async fn get_repos_for_org(&self, org: &str) -> Result<Vec<RepoItem>, reqwest::Error> {
+    pub async fn get_repos_for_org(&self, org: &str) -> Result<Vec<RepoItem>, String> {
         let url = format!(
             "https://api.github.com/orgs/{}/repos?per_page=100&sort=pushed",
             org
         );
-        let res = self.client.get(&url).send().await?;
-        match res.error_for_status() {
-            Ok(r) => r.json::<Vec<RepoItem>>().await,
+        match self.paginate_repos(url, 1000).await {
+            Ok(repos) => Ok(repos),
             Err(_) => self.get_repos_for_user(org, false).await,
         }
     }
 
-    pub async fn get_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>, reqwest::Error> {
+    pub async fn get_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>, String> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/branches?per_page=100",
             owner, repo
         );
-        let res = self.client.get(&url).send().await?;
-        let branches = res.error_for_status()?.json::<Vec<BranchItem>>().await?;
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        let branches = res.json::<Vec<BranchItem>>().await.map_err(|e| e.to_string())?;
         Ok(branches.into_iter().map(|b| b.name).collect())
     }
 
@@ -190,7 +306,7 @@ impl GitHubClient {
         repo: &str,
         path: &str,
         branch: Option<&str>,
-    ) -> Result<Vec<ContentItem>, reqwest::Error> {
+    ) -> Result<Vec<ContentItem>, String> {
         let clean_path = path.trim_start_matches('/').trim_end_matches('/');
         let ref_param = branch.map(|b| format!("?ref={}", urlencoding(b))).unwrap_or_default();
         let url = if clean_path.is_empty() {
@@ -202,10 +318,20 @@ impl GitHubClient {
             )
         };
 
-        let res = self.client.get(&url).send().await?;
-        let res = res.error_for_status()?;
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+
+        let res = res.error_for_status().map_err(|e| {
+            if e.status() == Some(reqwest::StatusCode::NOT_FOUND) {
+                "Empty repository or folder not found.".to_string()
+            } else if e.status() == Some(reqwest::StatusCode::FORBIDDEN) {
+                "Rate limit exceeded or permission denied.".to_string()
+            } else {
+                e.to_string()
+            }
+        })?;
         
-        let value = res.json::<serde_json::Value>().await?;
+        let value = res.json::<serde_json::Value>().await.map_err(|e| e.to_string())?;
         if let Some(arr) = value.as_array() {
             let mut items: Vec<ContentItem> = serde_json::from_value(serde_json::Value::Array(arr.clone()))
                 .unwrap_or_default();
@@ -230,6 +356,7 @@ impl GitHubClient {
         let ref_param = branch.map(|b| format!("?ref={}", urlencoding(b))).unwrap_or_default();
         let url = format!("https://api.github.com/repos/{}/{}/readme{}", owner, repo, ref_param);
         let res = self.client.get(&url).send().await.ok()?;
+        self.rate_limit.update_from_headers(res.headers());
         if !res.status().is_success() {
             return None;
         }
@@ -253,6 +380,7 @@ impl GitHubClient {
             owner, repo, clean_path, ref_param
         );
         let res = self.client.get(&url).send().await.ok()?;
+        self.rate_limit.update_from_headers(res.headers());
         if !res.status().is_success() {
             return None;
         }
@@ -266,10 +394,24 @@ impl GitHubClient {
         }
         if let Some(dl) = item.download_url {
             let res = self.client.get(&dl).send().await.ok()?;
+            self.rate_limit.update_from_headers(res.headers());
             return res.bytes().await.ok().map(|b| b.to_vec());
         }
         None
     }
+}
+
+fn parse_next_link(link: &str) -> Option<String> {
+    for part in link.split(',') {
+        let segs: Vec<&str> = part.split(';').map(|s| s.trim()).collect();
+        if segs.len() >= 2 && segs[1] == "rel=\"next\"" {
+            let url_part = segs[0];
+            if url_part.starts_with('<') && url_part.ends_with('>') {
+                return Some(url_part[1..url_part.len() - 1].to_string());
+            }
+        }
+    }
+    None
 }
 
 fn urlencoding(s: &str) -> String {

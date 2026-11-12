@@ -1,65 +1,62 @@
 # 🦆 pato
 
-A fast, lightweight Yazi-inspired remote GitHub repository and file explorer TUI built with Rust, `ratatui`, and `crossterm`.
+A fast, lightweight GitHub repository and tree explorer TUI with Miller-columns, inspired by `yazi`.
 
-Browse GitHub personal accounts, organizations, repositories, directory trees, branches, and remote files with full syntax highlighting as if they were local folders.
-
----
-
-## Highlights
-
-- **Ink Theme**: True black background (`#000000`), crisp white (`#f0f0f0`), neutral grey borders (`#828282`), and inverted solid block highlights.
-- **Yazi-style 3-Column Miller Navigation**: Context $\rightarrow$ Active list $\rightarrow$ Live async preview.
-- **Branch Switching (`b`)**: Choose and switch to any remote branch on any repo on the fly.
-- **Persistent Saved Accounts**: Added public users and organizations are auto-saved to `~/.config/pato/saved_accounts.json`. Press `r` on any saved account in the Accounts pane to remove it.
-- **Aligned Status Grid**: 4-column aligned repository indicators (`🔒` private, `📦` archived, `🔱` fork, `📁` repo) so repo names start on the exact same column.
-- **Multi-criteria Sorting (`s`)**: Cycle between Latest Updated, Latest Created, A-Z, Public/Private, Archived/Active, Source/Fork, and Language.
-- **Terminal Image Previews**: High-resolution 24-bit half-block (`▀`) image rendering (`png`, `jpg`, `webp`, `gif`, `bmp`).
-- **Oversized File Safeguards**: Prevents UI freeze on files > 100KB with clean download options.
-- **1-Key Actions**:
-  - `c`: Git clone selected repo into the directory where you launched `pato`.
-  - `C` (`Shift+c`): Copy `.git` clone URL to clipboard.
-  - `d`: Download selected file into your launch directory.
-  - `D` (`Shift+d`): Copy web URL of current repo, file, or profile to clipboard.
-  - `o`: Open in default browser (`xdg-open`).
-  - `/`: Fuzzy / substring filter.
-  - `?`: Keybindings guidance overlay.
+Browse your personal accounts, organizations, repositories, directory trees, branches, and code files with syntax highlighting as if they were local directories.
 
 ---
 
-## Keybindings Cheatsheet
+## Installation
+
+### From Source
+
+Ensure you have Rust (`cargo`) installed:
+
+```bash
+git clone https://github.com/heelgueta/pato.git
+cd pato
+cargo build --release
+cp target/release/pato ~/.local/bin/  # or ~/.cargo/bin/
+```
+
+### Authentication
+
+`pato` zero-config authenticates via your existing GitHub CLI setup:
+```bash
+gh auth login
+```
+Or by setting `export GITHUB_TOKEN="ghp_..."`. If unauthenticated, `pato` still works in public-only mode (60 requests/hour).
+
+---
+
+## Keybindings
 
 | Key | Action |
 | --- | --- |
-| `hjkl` / `Arrows` | Move selection & step into (`l`/`Right`/`Enter`) or back (`h`/`Left`/`Backspace`) |
+| `h` `j` `k` `l` / Arrows | Navigate list, step into (`l` / `Enter`) or back (`h` / `Backspace`) |
 | `J` / `K` | Scroll preview pane down / up |
-| `b` | **Switch branch** for selected repo (choose from available remote branches) |
+| `b` | **Switch branch** (select from available remote branches) |
 | `s` | **Cycle sort mode** (Updated / Created / A-Z / Status / Archived / Fork / Lang) |
-| `c` | **Git clone** selected repository into current launch directory |
-| `C` (`Shift+c`) | **Copy clone URL** (`.git`) to system clipboard |
-| `d` | **Download** selected remote file into current launch directory |
-| `D` (`Shift+d`) | **Copy web URL** of selected item (repo, file, or account) to clipboard |
-| `r` | **Remove** saved custom user/org from list (Accounts pane) |
-| `u` | Search / explore and auto-remember any public GitHub user or organization |
+| `c` | **Git clone** repository into launch folder |
+| `C` (`Shift+c`) | **Copy clone URL** (`.git`) to clipboard |
+| `d` | **Download** selected remote file into launch folder |
+| `D` (`Shift+d`) | **Copy web URL** of selected item to clipboard |
+| `r` | **Remove** saved user/org from list |
+| `R` (`Shift+r`) | **Refresh** current level and bypass cache |
+| `u` | Search / explore and auto-remember any public user or organization |
 | `o` | Open selected item in web browser (`xdg-open`) |
-| `/` | Live substring / fuzzy filter (Enter to lock, Esc to clear) |
-| `?` | Toggle keybindings guidance modal |
-| `q` / `Esc` | Quit / close modal / clear filter |
+| `/` | Live filter in active list |
+| `?` | Toggle keybindings cheat sheet |
+| `q` / `Esc` | Quit / clear filter / close dialog |
 
 ---
 
-## Installation & Running
+## Features
 
-The binary is installed at `~/.local/bin/pato` and `~/.cargo/bin/pato`.
-
-```bash
-# Run from any terminal directory:
-pato
-```
-
-### Build from source
-
-```bash
-cd repos/pato
-cargo build --release
-```
+- **Ink Monochrome Theme**: Crisp black-and-white terminal palette (`Border::Double`, clean dark panels).
+- **Yazi-style Cursor Memory**: Returning to a parent directory or repo list preserves your exact previous cursor position.
+- **Auto-Pagination**: Automatically follows GitHub Link headers up to 1,000 repositories so full lists are sorted and filtered accurately.
+- **Terminal Image Previews**: High-resolution 24-bit half-block (`▀`) rendering for `png`, `jpg`, `webp`, `gif`, and `bmp`.
+- **Live Rate-Limit Badge**: Displays live `API: <remaining>/<limit>` in header, warning when running low.
+- **Auto-Remembered Accounts**: Discovered users/orgs persist in `~/.config/pato/saved_accounts.json`.
+- **In-Pane Human Errors**: Friendly error messages inside panes with instant retry (`R`).

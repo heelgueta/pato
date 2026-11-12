@@ -3,6 +3,7 @@ use ratatui::widgets::ListState;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -112,6 +113,7 @@ pub enum AppEvent {
         query: String,
         results: Vec<SearchUserItem>,
     },
+    ActiveJobFinished(String),
     Error(String),
 }
 
@@ -119,7 +121,6 @@ pub enum AppEvent {
 pub struct HalfBlockImage {
     pub width: u16,
     pub height: u16,
-    // (top_color, bottom_color)
     pub pixels: Vec<(ratatui::style::Color, ratatui::style::Color)>,
 }
 
@@ -168,6 +169,18 @@ pub struct App {
     pub preview_cache: HashMap<String, PreviewContent>,
     pub branches_cache: HashMap<String, Vec<String>>,
     pub active_branch: HashMap<String, String>, // "owner/repo" -> branch name
+
+    // In-pane error tracking (key -> message)
+    pub pane_errors: HashMap<String, String>,
+
+    // Cursor position memory per level key (Yazi-style)
+    pub cursor_history: HashMap<String, usize>,
+
+    // Generation token for dropping stale background preview responses
+    pub preview_generation: Arc<AtomicU64>,
+
+    // Active background jobs indicator (e.g. "Cloning pato...", "Downloading index.js...")
+    pub active_job: Option<String>,
 
     // Loading tracking
     pub loading_keys: HashMap<String, bool>,
@@ -219,6 +232,10 @@ impl App {
             preview_cache: HashMap::new(),
             branches_cache: HashMap::new(),
             active_branch: HashMap::new(),
+            pane_errors: HashMap::new(),
+            cursor_history: HashMap::new(),
+            preview_generation: Arc::new(AtomicU64::new(0)),
+            active_job: None,
             loading_keys: HashMap::new(),
             repo_sort: RepoSort::PushedDesc,
             is_filtering: false,
@@ -236,6 +253,36 @@ impl App {
             preview_scroll: 0,
             should_quit: false,
         }
+    }
+
+    pub fn current_level_key(&self) -> String {
+        match &self.level {
+            NavigationLevel::Accounts => "root:accounts".to_string(),
+            NavigationLevel::Repos { owner, .. } => format!("repos:{}", owner),
+            NavigationLevel::Directory { owner, repo, path } => {
+                let branch = self.get_current_branch(owner, repo);
+                let b_str = branch.as_deref().unwrap_or("");
+                format!("dir:{}/{}:{}:{}", owner, repo, path, b_str)
+            }
+        }
+    }
+
+    pub fn save_current_cursor(&mut self) {
+        let key = self.current_level_key();
+        let idx = self.selected_index();
+        self.cursor_history.insert(key, idx);
+    }
+
+    pub fn restore_cursor_for_current_level(&mut self) {
+        let key = self.current_level_key();
+        let max_len = self.active_items_count();
+        if max_len == 0 {
+            self.list_state.select(None);
+            return;
+        }
+        let saved = self.cursor_history.get(&key).copied().unwrap_or(0);
+        let valid_idx = saved.min(max_len.saturating_sub(1));
+        self.list_state.select(Some(valid_idx));
     }
 
     pub fn config_path() -> PathBuf {
@@ -300,14 +347,51 @@ impl App {
         }
     }
 
+    pub fn refresh_current_level(&mut self) {
+        match &self.level.clone() {
+            NavigationLevel::Accounts => {
+                let client = Arc::clone(&self.client);
+                let tx = self.tx.clone();
+                tokio::spawn(async move {
+                    let user_res = client.get_current_user().await.ok();
+                    let orgs_res = client.get_user_orgs().await.unwrap_or_default();
+                    let _ = tx.send(AppEvent::InitialDataLoaded {
+                        current_user: user_res,
+                        orgs: orgs_res,
+                    });
+                });
+                self.set_status("Refreshing accounts & orgs...");
+            }
+            NavigationLevel::Repos { owner, is_user } => {
+                self.repos_cache.remove(owner);
+                self.pane_errors.remove(&format!("repos:{}", owner));
+                self.fetch_repos_if_needed(owner, *is_user);
+                self.set_status(format!("Refreshing {}'s repositories...", owner));
+            }
+            NavigationLevel::Directory { owner, repo, path } => {
+                let branch = self.get_current_branch(owner, repo);
+                let b_str = branch.as_deref().unwrap_or("");
+                let key = format!("{}/{}:{}:{}", owner, repo, path, b_str);
+                self.dir_cache.remove(&key);
+                self.pane_errors.remove(&format!("dir:{}", key));
+                self.fetch_dir_if_needed(owner, repo, path);
+                self.set_status(format!("Refreshing {} directory...", repo));
+            }
+        }
+        self.trigger_preview_fetch();
+    }
+
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), std::time::Instant::now()));
     }
 
-    pub fn get_status(&self) -> Option<&str> {
+    pub fn get_status(&self) -> Option<String> {
+        if let Some(ref job) = self.active_job {
+            return Some(format!("⏳ {}", job));
+        }
         if let Some((ref msg, time)) = self.status_message {
             if time.elapsed() < std::time::Duration::from_secs(4) {
-                return Some(msg.as_str());
+                return Some(msg.clone());
             }
         }
         None
@@ -477,11 +561,13 @@ impl App {
             new_sel = (count - 1) as isize;
         }
         self.list_state.select(Some(new_sel as usize));
+        self.save_current_cursor();
         self.preview_scroll = 0;
         self.trigger_preview_fetch();
     }
 
     pub fn step_into(&mut self) {
+        self.save_current_cursor();
         match &self.level.clone() {
             NavigationLevel::Accounts => {
                 let indices = self.filtered_account_indices();
@@ -500,9 +586,9 @@ impl App {
                             owner: owner.clone(),
                             is_user,
                         };
-                        self.list_state.select(Some(0));
                         self.filter_query.clear();
                         self.preview_scroll = 0;
+                        self.restore_cursor_for_current_level();
                         self.fetch_repos_if_needed(&owner, is_user);
                     }
                 }
@@ -516,9 +602,9 @@ impl App {
                         repo: repo_name.clone(),
                         path: String::new(),
                     };
-                    self.list_state.select(Some(0));
                     self.filter_query.clear();
                     self.preview_scroll = 0;
+                    self.restore_cursor_for_current_level();
                     self.fetch_dir_if_needed(owner, &repo_name, "");
                 }
             }
@@ -537,9 +623,9 @@ impl App {
                                     repo: repo.clone(),
                                     path: new_path.clone(),
                                 };
-                                self.list_state.select(Some(0));
                                 self.filter_query.clear();
                                 self.preview_scroll = 0;
+                                self.restore_cursor_for_current_level();
                                 self.fetch_dir_if_needed(owner, repo, &new_path);
                             }
                         }
@@ -550,13 +636,14 @@ impl App {
     }
 
     pub fn step_back(&mut self) {
+        self.save_current_cursor();
         match &self.level.clone() {
             NavigationLevel::Accounts => {}
             NavigationLevel::Repos { .. } => {
                 self.level = NavigationLevel::Accounts;
-                self.list_state.select(Some(0));
                 self.filter_query.clear();
                 self.preview_scroll = 0;
+                self.restore_cursor_for_current_level();
                 self.trigger_preview_fetch();
             }
             NavigationLevel::Directory { owner, repo, path } => {
@@ -571,9 +658,9 @@ impl App {
                         owner: owner.clone(),
                         is_user,
                     };
-                    self.list_state.select(Some(0));
                     self.filter_query.clear();
                     self.preview_scroll = 0;
+                    self.restore_cursor_for_current_level();
                     self.trigger_preview_fetch();
                 } else {
                     let parent_path = match clean.rfind('/') {
@@ -585,9 +672,9 @@ impl App {
                         repo: repo.clone(),
                         path: parent_path,
                     };
-                    self.list_state.select(Some(0));
                     self.filter_query.clear();
                     self.preview_scroll = 0;
+                    self.restore_cursor_for_current_level();
                     self.trigger_preview_fetch();
                 }
             }
@@ -622,7 +709,7 @@ impl App {
                     let _ = tx.send(AppEvent::ReposLoaded { owner, repos });
                 }
                 Err(err) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to load repos: {}", err)));
+                    let _ = tx.send(AppEvent::Error(format!("repos:{}:{}", owner, err)));
                 }
             }
         });
@@ -657,13 +744,16 @@ impl App {
                     });
                 }
                 Err(err) => {
-                    let _ = tx.send(AppEvent::Error(format!("Failed to load directory: {}", err)));
+                    let _ = tx.send(AppEvent::Error(format!("dir:{}:{}", key, err)));
                 }
             }
         });
     }
 
-    pub fn trigger_preview_fetch(&self) {
+    pub fn trigger_preview_fetch(&mut self) {
+        let current_gen = self.preview_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let gen_arc = Arc::clone(&self.preview_generation);
+
         match &self.level {
             NavigationLevel::Accounts => {
                 let indices = self.filtered_account_indices();
@@ -686,19 +776,22 @@ impl App {
                         tokio::spawn(async move {
                             if is_user {
                                 if let Ok(u) = client.get_user_profile(&name).await {
-                                    let _ = tx.send(AppEvent::PreviewLoaded {
-                                        key,
-                                        content: PreviewContent::User(u),
-                                    });
+                                    if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                        let _ = tx.send(AppEvent::PreviewLoaded {
+                                            key,
+                                            content: PreviewContent::User(u),
+                                        });
+                                    }
                                 }
                             } else {
-                                let _ = tx.send(AppEvent::PreviewLoaded {
-                                    key,
-                                    content: PreviewContent::Org(OrgItem {
-                                        login: name,
-                                        description: None,
-                                    }),
-                                });
+                                if let Ok(o) = client.get_org_profile(&name).await {
+                                    if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                        let _ = tx.send(AppEvent::PreviewLoaded {
+                                            key,
+                                            content: PreviewContent::Org(o),
+                                        });
+                                    }
+                                }
                             }
                         });
                     }
@@ -723,13 +816,15 @@ impl App {
 
                     tokio::spawn(async move {
                         let readme = client.get_readme(&o, &r, br.as_deref()).await;
-                        let _ = tx.send(AppEvent::PreviewLoaded {
-                            key,
-                            content: PreviewContent::Repo {
-                                repo: repo_clone,
-                                readme,
-                            },
-                        });
+                        if gen_arc.load(Ordering::SeqCst) == current_gen {
+                            let _ = tx.send(AppEvent::PreviewLoaded {
+                                key,
+                                content: PreviewContent::Repo {
+                                    repo: repo_clone,
+                                    readme,
+                                },
+                            });
+                        }
                     });
                 }
             }
@@ -756,26 +851,29 @@ impl App {
                             tokio::spawn(async move {
                                 if item_clone.item_type == "dir" {
                                     if let Ok(sub_items) = client.get_repo_contents(&o, &r, &item_clone.path, br.as_deref()).await {
-                                        let _ = tx.send(AppEvent::PreviewLoaded {
-                                            key,
-                                            content: PreviewContent::Directory(sub_items),
-                                        });
+                                        if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                            let _ = tx.send(AppEvent::PreviewLoaded {
+                                                key,
+                                                content: PreviewContent::Directory(sub_items),
+                                            });
+                                        }
                                     }
                                 } else {
                                     let ext = item_clone.name.rsplit('.').next().unwrap_or("").to_lowercase();
                                     let is_img = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp");
 
-                                    // Oversize check: 100KB cap
                                     if item_clone.size > 100 * 1024 && !is_img {
-                                        let _ = tx.send(AppEvent::PreviewLoaded {
-                                            key,
-                                            content: PreviewContent::FileOversized {
-                                                name: item_clone.name,
-                                                size: item_clone.size,
-                                                head_preview: None,
-                                                raw_url: item_clone.download_url,
-                                            },
-                                        });
+                                        if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                            let _ = tx.send(AppEvent::PreviewLoaded {
+                                                key,
+                                                content: PreviewContent::FileOversized {
+                                                    name: item_clone.name,
+                                                    size: item_clone.size,
+                                                    head_preview: None,
+                                                    raw_url: item_clone.download_url,
+                                                },
+                                            });
+                                        }
                                         return;
                                     }
 
@@ -784,41 +882,45 @@ impl App {
                                             if let Ok(img) = image::load_from_memory(&raw_bytes) {
                                                 let (w, h) = (img.width(), img.height());
                                                 let half = render_image_halfblocks(&img, 60, 24);
-                                                let _ = tx.send(AppEvent::PreviewLoaded {
-                                                    key,
-                                                    content: PreviewContent::Image {
-                                                        name: item_clone.name,
-                                                        width: w,
-                                                        height: h,
-                                                        half_block: Some(half),
-                                                    },
-                                                });
+                                                if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                                    let _ = tx.send(AppEvent::PreviewLoaded {
+                                                        key,
+                                                        content: PreviewContent::Image {
+                                                            name: item_clone.name,
+                                                            width: w,
+                                                            height: h,
+                                                            half_block: Some(half),
+                                                        },
+                                                    });
+                                                }
                                                 return;
                                             }
                                         }
 
                                         let is_binary = raw_bytes.contains(&0);
-                                        if is_binary {
-                                            let _ = tx.send(AppEvent::PreviewLoaded {
-                                                key,
-                                                content: PreviewContent::File {
-                                                    name: item_clone.name,
-                                                    content: "Binary file preview is omitted.".into(),
-                                                    is_binary: true,
-                                                },
-                                            });
-                                        } else {
-                                            let content = String::from_utf8_lossy(&raw_bytes).to_string();
-                                            let _ = tx.send(AppEvent::PreviewLoaded {
-                                                key,
-                                                content: PreviewContent::File {
-                                                    name: item_clone.name,
-                                                    content,
-                                                    is_binary: false,
-                                                },
-                                            });
+                                        if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                            if is_binary {
+                                                let _ = tx.send(AppEvent::PreviewLoaded {
+                                                    key,
+                                                    content: PreviewContent::File {
+                                                        name: item_clone.name,
+                                                        content: "Binary file preview is omitted.".into(),
+                                                        is_binary: true,
+                                                    },
+                                                });
+                                            } else {
+                                                let content = String::from_utf8_lossy(&raw_bytes).to_string();
+                                                let _ = tx.send(AppEvent::PreviewLoaded {
+                                                    key,
+                                                    content: PreviewContent::File {
+                                                        name: item_clone.name,
+                                                        content,
+                                                        is_binary: false,
+                                                    },
+                                                });
+                                            }
                                         }
-                                    } else {
+                                    } else if gen_arc.load(Ordering::SeqCst) == current_gen {
                                         let _ = tx.send(AppEvent::PreviewLoaded {
                                             key,
                                             content: PreviewContent::Error("Unable to fetch file content".into()),
@@ -853,17 +955,17 @@ impl App {
                             let br = branch.clone();
                             let tx = self.tx.clone();
 
-                            self.set_status(format!("Downloading {}...", file_name));
+                            self.active_job = Some(format!("Downloading {}...", file_name));
 
                             tokio::spawn(async move {
                                 if let Some(bytes) = client.get_file_content_raw(&o, &r, &item_p, br.as_deref()).await {
                                     if std::fs::write(&target_path, bytes).is_ok() {
-                                        let _ = tx.send(AppEvent::Error(format!("Downloaded -> {}", target_str)));
+                                        let _ = tx.send(AppEvent::ActiveJobFinished(format!("Downloaded -> {}", target_str)));
                                     } else {
-                                        let _ = tx.send(AppEvent::Error(format!("Failed to write {}", target_str)));
+                                        let _ = tx.send(AppEvent::ActiveJobFinished(format!("Failed to write {}", target_str)));
                                     }
                                 } else {
-                                    let _ = tx.send(AppEvent::Error("Failed to fetch file content".into()));
+                                    let _ = tx.send(AppEvent::ActiveJobFinished("Failed to fetch file content".into()));
                                 }
                             });
                         }
@@ -894,7 +996,7 @@ impl App {
         let target_str = target_dir.display().to_string();
         let clone_url = format!("https://github.com/{}/{}.git", owner, repo_name);
 
-        self.set_status(format!("Cloning {} into {} ...", repo_name, target_str));
+        self.active_job = Some(format!("Cloning {} into {} ...", repo_name, target_str));
 
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -905,14 +1007,14 @@ impl App {
 
             match output {
                 Ok(out) if out.status.success() => {
-                    let _ = tx.send(AppEvent::Error(format!("Cloned into {}", target_str)));
+                    let _ = tx.send(AppEvent::ActiveJobFinished(format!("Cloned into {}", target_str)));
                 }
                 Ok(out) => {
                     let err_msg = String::from_utf8_lossy(&out.stderr);
-                    let _ = tx.send(AppEvent::Error(format!("Git error: {}", err_msg.trim())));
+                    let _ = tx.send(AppEvent::ActiveJobFinished(format!("Git error: {}", err_msg.trim())));
                 }
                 Err(e) => {
-                    let _ = tx.send(AppEvent::Error(format!("Clone failed: {}", e)));
+                    let _ = tx.send(AppEvent::ActiveJobFinished(format!("Clone failed: {}", e)));
                 }
             }
         });

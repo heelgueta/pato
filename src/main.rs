@@ -31,8 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Load auto-remembered accounts from ~/.config/pato/saved_accounts.json
     app.load_saved_accounts();
 
-    // Initial load: current user & organizations
-    {
+    // Initial load: current user & organizations (if authenticated)
+    if app.client.is_authenticated() {
         let client = Arc::clone(&app.client);
         let event_tx = tx.clone();
         tokio::spawn(async move {
@@ -43,6 +43,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 orgs: orgs_res,
             });
         });
+    } else {
+        app.set_status("Unauthenticated mode (run `gh auth login` for full private access)");
     }
 
     let mut preview_debounce_timer: Option<tokio::time::Instant> = None;
@@ -77,12 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     new_accounts.push(AccountEntry::AddNew);
                     app.accounts = new_accounts;
                     app.current_user = current_user;
-                    app.list_state.select(Some(0));
+                    app.restore_cursor_for_current_level();
                     app.trigger_preview_fetch();
                 }
                 AppEvent::ReposLoaded { owner, repos } => {
                     app.loading_keys.remove(&format!("repos:{}", owner));
+                    app.pane_errors.remove(&format!("repos:{}", owner));
                     app.repos_cache.insert(owner.clone(), repos);
+                    app.restore_cursor_for_current_level();
                     app.trigger_preview_fetch();
                 }
                 AppEvent::BranchesLoaded { owner, repo, branches } => {
@@ -99,7 +103,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let b_str = branch.as_deref().unwrap_or("");
                     let key = format!("{}/{}:{}:{}", owner, repo, path, b_str);
                     app.loading_keys.remove(&format!("dir:{}", key));
+                    app.pane_errors.remove(&format!("dir:{}", key));
                     app.dir_cache.insert(key, items);
+                    app.restore_cursor_for_current_level();
                     app.trigger_preview_fetch();
                 }
                 AppEvent::PreviewLoaded { key, content } => {
@@ -111,7 +117,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         app.search_selected = 0;
                     }
                 }
+                AppEvent::ActiveJobFinished(msg) => {
+                    app.active_job = None;
+                    app.set_status(msg);
+                }
                 AppEvent::Error(err) => {
+                    // Check if error is prefix-tagged with key for in-pane display
+                    if let Some(pos) = err.find(':') {
+                        let prefix = &err[..pos];
+                        if prefix == "repos" || prefix == "dir" {
+                            let rest = &err[pos + 1..];
+                            if let Some(second_pos) = rest.find(':') {
+                                let key = format!("{}:{}", prefix, &rest[..second_pos]);
+                                let msg = &rest[second_pos + 1..];
+                                app.loading_keys.remove(&key);
+                                app.pane_errors.insert(key, msg.to_string());
+                                continue;
+                            }
+                        }
+                    }
                     app.set_status(err);
                 }
             }
@@ -184,7 +208,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         let owner = o.clone();
                                         let repo = r.clone();
                                         app.set_current_branch(&owner, &repo, b);
-                                        // If currently inside directory, refresh current dir under new branch
                                         if let app::NavigationLevel::Directory { path, .. } = &app.level.clone() {
                                             app.fetch_dir_if_needed(&owner, &repo, path);
                                         }
@@ -312,6 +335,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Char('r') => {
                             app.remove_selected_account();
+                        }
+                        KeyCode::Char('R') => {
+                            app.refresh_current_level();
                         }
                         KeyCode::Char('s') => {
                             app.cycle_sort();

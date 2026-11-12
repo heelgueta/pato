@@ -6,6 +6,7 @@ use ratatui::{
     widgets::{Block, BorderType, Borders, Clear, List, ListItem, Paragraph, Wrap},
     Frame,
 };
+use std::sync::atomic::Ordering;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
@@ -109,10 +110,31 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         "".to_string()
     };
 
+    // Rate-limit display
+    let remaining = app.client.rate_limit.remaining.load(Ordering::Relaxed);
+    let limit = app.client.rate_limit.limit.load(Ordering::Relaxed);
+    let is_low = limit > 0 && (remaining as f64 / limit as f64) < 0.10;
+
+    let auth_status = if !app.client.is_authenticated() {
+        Span::styled(" [Unauthenticated: 60/h] ", Style::default().fg(DIM))
+    } else {
+        Span::raw("")
+    };
+
+    let rate_style = if is_low {
+        Style::default().fg(FG).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(DIM)
+    };
+
+    let rate_span = Span::styled(format!("  API {}/{} ", remaining, limit), rate_style);
+
     let title_line = Line::from(vec![
         Span::styled(path_str, Style::default().fg(FG).add_modifier(Modifier::BOLD)),
         Span::styled(sort_indicator, Style::default().fg(DIM)),
-        Span::styled("   (? for help)", Style::default().fg(DIM)),
+        auth_status,
+        rate_span,
+        Span::styled("  (? help, R refresh)", Style::default().fg(DIM)),
     ]);
 
     let p = Paragraph::new(title_line).style(Style::default().bg(PANEL));
@@ -179,7 +201,7 @@ fn render_left_pane(f: &mut Frame, app: &App, area: Rect) {
                         } else {
                             Style::default().fg(DIM)
                         };
-                        ListItem::new(Span::styled(format!("📁 {}", r.name), st))
+                        ListItem::new(Span::styled(format!("📦 {}", r.name), st))
                     })
                     .collect()
             } else {
@@ -228,6 +250,7 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
 
     let mut list_items = Vec::new();
     let mut is_loading = false;
+    let mut pane_error_opt: Option<String> = None;
 
     match &app.level {
         NavigationLevel::Accounts => {
@@ -264,39 +287,44 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
             }
         }
         NavigationLevel::Repos { owner, .. } => {
-            let is_fetching = app.loading_keys.get(&format!("repos:{}", owner)).copied().unwrap_or(false);
-            let has_cache = app.repos_cache.contains_key(owner);
-
-            if is_fetching && !has_cache {
-                is_loading = true;
+            let err_key = format!("repos:{}", owner);
+            if let Some(err) = app.pane_errors.get(&err_key) {
+                pane_error_opt = Some(err.clone());
             } else {
-                let sorted_repos = app.get_sorted_and_filtered_repos(owner);
-                for (_, repo) in sorted_repos {
-                    let priv_icon = if repo.private { "🔒" } else { "  " };
-                    let arch_icon = if repo.archived { "📦" } else { "  " };
-                    let fork_icon = if repo.fork { "🔱" } else { "  " };
-                    let repo_icon = "📁";
+                let is_fetching = app.loading_keys.get(&err_key).copied().unwrap_or(false);
+                let has_cache = app.repos_cache.contains_key(owner);
 
-                    let lang = repo.language.as_deref().unwrap_or("");
-                    let lang_tag = if !lang.is_empty() {
-                        format!(" [{}]", lang)
-                    } else {
-                        "".to_string()
-                    };
+                if is_fetching && !has_cache {
+                    is_loading = true;
+                } else {
+                    let sorted_repos = app.get_sorted_and_filtered_repos(owner);
+                    for (_, repo) in sorted_repos {
+                        let priv_icon = if repo.private { "🔒" } else { "  " };
+                        let arch_icon = if repo.archived { "📦" } else { "  " };
+                        let fork_icon = if repo.fork { "🔱" } else { "  " };
+                        let repo_icon = "📁";
 
-                    let active_br = app.get_current_branch(owner, &repo.name);
-                    let br_tag = active_br.map(|b| format!(" ({})", b)).unwrap_or_default();
+                        let lang = repo.language.as_deref().unwrap_or("");
+                        let lang_tag = if !lang.is_empty() {
+                            format!(" [{}]", lang)
+                        } else {
+                            "".to_string()
+                        };
 
-                    let line = Line::from(vec![
-                        Span::styled(format!("{} ", priv_icon), Style::default().fg(DIM)),
-                        Span::styled(format!("{} ", arch_icon), Style::default().fg(DIM)),
-                        Span::styled(format!("{} ", fork_icon), Style::default().fg(DIM)),
-                        Span::styled(format!("{} ", repo_icon), Style::default().fg(FG)),
-                        Span::styled(repo.name.clone(), Style::default().fg(FG)),
-                        Span::styled(br_tag, Style::default().fg(DIM)),
-                        Span::styled(lang_tag, Style::default().fg(DIM)),
-                    ]);
-                    list_items.push(ListItem::new(line));
+                        let active_br = app.get_current_branch(owner, &repo.name);
+                        let br_tag = active_br.map(|b| format!(" ({})", b)).unwrap_or_default();
+
+                        let line = Line::from(vec![
+                            Span::styled(format!("{} ", priv_icon), Style::default().fg(DIM)),
+                            Span::styled(format!("{} ", arch_icon), Style::default().fg(DIM)),
+                            Span::styled(format!("{} ", fork_icon), Style::default().fg(DIM)),
+                            Span::styled(format!("{} ", repo_icon), Style::default().fg(FG)),
+                            Span::styled(repo.name.clone(), Style::default().fg(FG)),
+                            Span::styled(br_tag, Style::default().fg(DIM)),
+                            Span::styled(lang_tag, Style::default().fg(DIM)),
+                        ]);
+                        list_items.push(ListItem::new(line));
+                    }
                 }
             }
         }
@@ -304,36 +332,42 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
             let branch = app.get_current_branch(owner, repo);
             let b_str = branch.as_deref().unwrap_or("");
             let key = format!("{}/{}:{}:{}", owner, repo, path, b_str);
-            let is_fetching = app.loading_keys.get(&format!("dir:{}", key)).copied().unwrap_or(false);
-            let has_cache = app.dir_cache.contains_key(&key);
+            let err_key = format!("dir:{}", key);
 
-            if is_fetching && !has_cache {
-                is_loading = true;
+            if let Some(err) = app.pane_errors.get(&err_key) {
+                pane_error_opt = Some(err.clone());
             } else {
-                let indices = app.filtered_content_indices(&key);
-                if let Some(items) = app.dir_cache.get(&key) {
-                    for &idx in &indices {
-                        if let Some(item) = items.get(idx) {
-                            if item.item_type == "dir" {
-                                let line = Line::from(vec![
-                                    Span::styled(format!("📁 {}/", item.name), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
-                                ]);
-                                list_items.push(ListItem::new(line));
-                            } else {
-                                let icon = match item.name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
-                                    "rs" => "🦀",
-                                    "py" => "🐍",
-                                    "js" | "ts" => "📜",
-                                    "md" => "📝",
-                                    "json" | "toml" | "yaml" | "yml" => "⚙️",
-                                    "png" | "jpg" | "jpeg" | "webp" | "gif" => "🖼️",
-                                    _ => "📄",
-                                };
-                                let line = Line::from(vec![
-                                    Span::raw(format!("{} ", icon)),
-                                    Span::styled(item.name.clone(), Style::default().fg(FG)),
-                                ]);
-                                list_items.push(ListItem::new(line));
+                let is_fetching = app.loading_keys.get(&err_key).copied().unwrap_or(false);
+                let has_cache = app.dir_cache.contains_key(&key);
+
+                if is_fetching && !has_cache {
+                    is_loading = true;
+                } else {
+                    let indices = app.filtered_content_indices(&key);
+                    if let Some(items) = app.dir_cache.get(&key) {
+                        for &idx in &indices {
+                            if let Some(item) = items.get(idx) {
+                                if item.item_type == "dir" {
+                                    let line = Line::from(vec![
+                                        Span::styled(format!("📁 {}/", item.name), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                                    ]);
+                                    list_items.push(ListItem::new(line));
+                                } else {
+                                    let icon = match item.name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+                                        "rs" => "🦀",
+                                        "py" => "🐍",
+                                        "js" | "ts" => "📜",
+                                        "md" => "📝",
+                                        "json" | "toml" | "yaml" | "yml" => "⚙️",
+                                        "png" | "jpg" | "jpeg" | "webp" | "gif" => "🖼️",
+                                        _ => "📄",
+                                    };
+                                    let line = Line::from(vec![
+                                        Span::raw(format!("{} ", icon)),
+                                        Span::styled(item.name.clone(), Style::default().fg(FG)),
+                                    ]);
+                                    list_items.push(ListItem::new(line));
+                                }
                             }
                         }
                     }
@@ -342,7 +376,14 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
         }
     }
 
-    if list_items.is_empty() {
+    if let Some(err) = pane_error_opt {
+        list_items.clear();
+        list_items.push(ListItem::new(Line::from(vec![
+            Span::styled("  ⚠️ ", Style::default().fg(FG)),
+            Span::styled(err, Style::default().fg(DIM)),
+        ])));
+        list_items.push(ListItem::new(Span::styled("  (Press 'R' to retry fetch)", Style::default().fg(DIM).add_modifier(Modifier::ITALIC))));
+    } else if list_items.is_empty() {
         if is_loading {
             list_items.push(ListItem::new(Span::styled(
                 "  ⏳ Loading...",
@@ -470,18 +511,65 @@ fn render_right_pane(f: &mut Frame, app: &App, highlighter: &SyntaxHighlighter, 
             f.render_widget(p, area);
         }
         Some(PreviewContent::Org(o)) => {
-            let lines = vec![
+            let role_badge = o.role.as_ref().map(|r| format!("  [Role: {}]", r)).unwrap_or_default();
+            let mut lines = vec![
                 Line::from(vec![
                     Span::styled("🏢 Organization: ", Style::default().fg(DIM)),
                     Span::styled(&o.login, Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                    Span::styled(role_badge, Style::default().fg(DIM)),
                 ]),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled("Description: ", Style::default().fg(DIM)),
-                    Span::styled(o.description.as_deref().unwrap_or("No description"), Style::default().fg(FG)),
-                ]),
             ];
-            let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
+
+            if let Some(ref name) = o.name {
+                lines.push(Line::from(vec![
+                    Span::styled("Full Name: ", Style::default().fg(DIM)),
+                    Span::styled(name, Style::default().fg(FG)),
+                ]));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("Description: ", Style::default().fg(DIM)),
+                Span::styled(o.description.as_deref().unwrap_or("No description"), Style::default().fg(FG)),
+            ]));
+
+            if let Some(ref loc) = o.location {
+                lines.push(Line::from(vec![
+                    Span::styled("Location: ", Style::default().fg(DIM)),
+                    Span::styled(loc, Style::default().fg(FG)),
+                ]));
+            }
+
+            if let Some(ref blog) = o.blog {
+                lines.push(Line::from(vec![
+                    Span::styled("Website: ", Style::default().fg(DIM)),
+                    Span::styled(blog, Style::default().fg(FG)),
+                ]));
+            }
+
+            lines.push(Line::from(vec![
+                Span::styled("Public Repos: ", Style::default().fg(DIM)),
+                Span::styled(o.public_repos.unwrap_or(0).to_string(), Style::default().fg(FG)),
+                Span::raw("  |  "),
+                Span::styled("Followers: ", Style::default().fg(DIM)),
+                Span::styled(o.followers.unwrap_or(0).to_string(), Style::default().fg(FG)),
+            ]));
+
+            if let Some(ref created) = o.created_at {
+                lines.push(Line::from(vec![
+                    Span::styled("Created At: ", Style::default().fg(DIM)),
+                    Span::styled(created, Style::default().fg(FG)),
+                ]));
+            }
+
+            if let Some(ref url) = o.html_url {
+                lines.push(Line::from(vec![
+                    Span::styled("URL: ", Style::default().fg(DIM)),
+                    Span::styled(url, Style::default().fg(FG)),
+                ]));
+            }
+
+            let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: false });
             f.render_widget(p, area);
         }
         Some(PreviewContent::Repo { repo, readme }) => {
@@ -663,6 +751,8 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(":copy-url ", Style::default().fg(DIM)),
             Span::styled("r", Style::default().fg(FG)),
             Span::styled(":remove-saved ", Style::default().fg(DIM)),
+            Span::styled("R", Style::default().fg(FG)),
+            Span::styled(":refresh ", Style::default().fg(DIM)),
             Span::styled("s", Style::default().fg(FG)),
             Span::styled(":sort ", Style::default().fg(DIM)),
             Span::styled("/", Style::default().fg(FG)),
@@ -786,7 +876,7 @@ fn render_branch_modal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help_modal(f: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(58, 65, area);
+    let popup_area = centered_rect(58, 68, area);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -800,13 +890,14 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
         ("hjkl / Arrows", "Navigate lists & step into / back"),
         ("J / K", "Scroll preview pane down / up"),
         ("/", "Fuzzy / substring filter in list"),
-        ("b", "Switch branch for current repo (choose from available branches)"),
+        ("b", "Switch branch for current repo (choose from available remote branches)"),
         ("s", "Cycle repo sort (Updated / Created / A-Z / Status / Archived / Fork / Lang)"),
         ("c", "Git clone selected repo into launch folder"),
         ("C (Shift+c)", "Copy clone URL (.git) to system clipboard"),
         ("d", "Download selected file into current launch folder"),
         ("D (Shift+d)", "Copy Web URL of selected repo, account, or file to clipboard"),
         ("r", "Remove saved custom user/org from list"),
+        ("R (Shift+r)", "Refresh current level and re-fetch from GitHub"),
         ("o", "Open repo / file / account in browser (xdg-open)"),
         ("u", "Quick popup to explore and auto-remember any user/org"),
         ("?", "Toggle this keybindings guide"),
