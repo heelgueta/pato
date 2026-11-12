@@ -1,0 +1,285 @@
+use serde::Deserialize;
+use std::process::Command;
+
+#[derive(Debug, Clone)]
+pub struct GitHubClient {
+    client: reqwest::Client,
+    pub token: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserInfo {
+    pub login: String,
+    pub name: Option<String>,
+    pub bio: Option<String>,
+    pub public_repos: Option<u64>,
+    pub followers: Option<u64>,
+    pub following: Option<u64>,
+    pub html_url: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct OrgItem {
+    pub login: String,
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct RepoItem {
+    pub name: String,
+    pub full_name: String,
+    pub description: Option<String>,
+    pub private: bool,
+    pub fork: bool,
+    #[serde(default)]
+    pub archived: bool,
+    pub html_url: String,
+    pub clone_url: String,
+    pub ssh_url: String,
+    pub stargazers_count: u64,
+    pub forks_count: u64,
+    pub language: Option<String>,
+    pub default_branch: Option<String>,
+    pub pushed_at: Option<String>,
+    pub created_at: Option<String>,
+    pub updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BranchItem {
+    pub name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContentItem {
+    pub name: String,
+    pub path: String,
+    pub sha: String,
+    pub size: u64,
+    pub html_url: Option<String>,
+    pub download_url: Option<String>,
+    #[serde(rename = "type")]
+    pub item_type: String, // "file", "dir", "symlink", "submodule"
+    pub content: Option<String>,
+    pub encoding: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SearchUserItem {
+    pub login: String,
+    #[serde(rename = "type")]
+    pub user_type: Option<String>, // "User" or "Organization"
+    pub html_url: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchUsersResponse {
+    pub items: Vec<SearchUserItem>,
+}
+
+impl GitHubClient {
+    pub fn new() -> Self {
+        let token = std::env::var("GITHUB_TOKEN").ok().or_else(|| {
+            let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
+            if output.status.success() {
+                let tok = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !tok.is_empty() {
+                    return Some(tok);
+                }
+            }
+            None
+        });
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::USER_AGENT,
+            reqwest::header::HeaderValue::from_static("pato-tui/0.1.0"),
+        );
+        headers.insert(
+            reqwest::header::ACCEPT,
+            reqwest::header::HeaderValue::from_static("application/vnd.github.v3+json"),
+        );
+
+        if let Some(ref tok) = token {
+            if let Ok(val) = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", tok)) {
+                headers.insert(reqwest::header::AUTHORIZATION, val);
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .default_headers(headers)
+            .build()
+            .unwrap_or_default();
+
+        Self { client, token }
+    }
+
+    pub async fn get_current_user(&self) -> Result<UserInfo, reqwest::Error> {
+        let res = self.client.get("https://api.github.com/user").send().await?;
+        res.error_for_status()?.json::<UserInfo>().await
+    }
+
+    pub async fn get_user_profile(&self, username: &str) -> Result<UserInfo, reqwest::Error> {
+        let url = format!("https://api.github.com/users/{}", username);
+        let res = self.client.get(&url).send().await?;
+        res.error_for_status()?.json::<UserInfo>().await
+    }
+
+    pub async fn get_user_orgs(&self) -> Result<Vec<OrgItem>, reqwest::Error> {
+        let res = self
+            .client
+            .get("https://api.github.com/user/orgs?per_page=100")
+            .send()
+            .await?;
+        res.error_for_status()?.json::<Vec<OrgItem>>().await
+    }
+
+    pub async fn search_users(&self, query: &str) -> Result<Vec<SearchUserItem>, reqwest::Error> {
+        let url = format!(
+            "https://api.github.com/search/users?q={}&per_page=10",
+            urlencoding(query)
+        );
+        let res = self.client.get(&url).send().await?;
+        let resp = res.error_for_status()?.json::<SearchUsersResponse>().await?;
+        Ok(resp.items)
+    }
+
+    pub async fn get_repos_for_user(
+        &self,
+        username: &str,
+        is_authenticated_user: bool,
+    ) -> Result<Vec<RepoItem>, reqwest::Error> {
+        let url = if is_authenticated_user {
+            "https://api.github.com/user/repos?per_page=100&sort=pushed&affiliation=owner,collaborator".to_string()
+        } else {
+            format!(
+                "https://api.github.com/users/{}/repos?per_page=100&sort=pushed",
+                username
+            )
+        };
+        let res = self.client.get(&url).send().await?;
+        let repos = res.error_for_status()?.json::<Vec<RepoItem>>().await?;
+        Ok(repos)
+    }
+
+    pub async fn get_repos_for_org(&self, org: &str) -> Result<Vec<RepoItem>, reqwest::Error> {
+        let url = format!(
+            "https://api.github.com/orgs/{}/repos?per_page=100&sort=pushed",
+            org
+        );
+        let res = self.client.get(&url).send().await?;
+        match res.error_for_status() {
+            Ok(r) => r.json::<Vec<RepoItem>>().await,
+            Err(_) => self.get_repos_for_user(org, false).await,
+        }
+    }
+
+    pub async fn get_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>, reqwest::Error> {
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/branches?per_page=100",
+            owner, repo
+        );
+        let res = self.client.get(&url).send().await?;
+        let branches = res.error_for_status()?.json::<Vec<BranchItem>>().await?;
+        Ok(branches.into_iter().map(|b| b.name).collect())
+    }
+
+    pub async fn get_repo_contents(
+        &self,
+        owner: &str,
+        repo: &str,
+        path: &str,
+        branch: Option<&str>,
+    ) -> Result<Vec<ContentItem>, reqwest::Error> {
+        let clean_path = path.trim_start_matches('/').trim_end_matches('/');
+        let ref_param = branch.map(|b| format!("?ref={}", urlencoding(b))).unwrap_or_default();
+        let url = if clean_path.is_empty() {
+            format!("https://api.github.com/repos/{}/{}/contents{}", owner, repo, ref_param)
+        } else {
+            format!(
+                "https://api.github.com/repos/{}/{}/contents/{}{}",
+                owner, repo, clean_path, ref_param
+            )
+        };
+
+        let res = self.client.get(&url).send().await?;
+        let res = res.error_for_status()?;
+        
+        let value = res.json::<serde_json::Value>().await?;
+        if let Some(arr) = value.as_array() {
+            let mut items: Vec<ContentItem> = serde_json::from_value(serde_json::Value::Array(arr.clone()))
+                .unwrap_or_default();
+            items.sort_by(|a, b| {
+                let a_is_dir = a.item_type == "dir";
+                let b_is_dir = b.item_type == "dir";
+                match (a_is_dir, b_is_dir) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+                }
+            });
+            Ok(items)
+        } else if let Ok(single) = serde_json::from_value::<ContentItem>(value) {
+            Ok(vec![single])
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    pub async fn get_readme(&self, owner: &str, repo: &str, branch: Option<&str>) -> Option<String> {
+        let ref_param = branch.map(|b| format!("?ref={}", urlencoding(b))).unwrap_or_default();
+        let url = format!("https://api.github.com/repos/{}/{}/readme{}", owner, repo, ref_param);
+        let res = self.client.get(&url).send().await.ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        let item = res.json::<ContentItem>().await.ok()?;
+        if let (Some(content), Some(encoding)) = (item.content, item.encoding) {
+            if encoding == "base64" {
+                let clean = content.replace('\n', "").replace('\r', "");
+                use base64::Engine;
+                let decoded = base64::engine::general_purpose::STANDARD.decode(clean).ok()?;
+                return String::from_utf8(decoded).ok();
+            }
+        }
+        None
+    }
+
+    pub async fn get_file_content_raw(&self, owner: &str, repo: &str, path: &str, branch: Option<&str>) -> Option<Vec<u8>> {
+        let clean_path = path.trim_start_matches('/');
+        let ref_param = branch.map(|b| format!("?ref={}", urlencoding(b))).unwrap_or_default();
+        let url = format!(
+            "https://api.github.com/repos/{}/{}/contents/{}{}",
+            owner, repo, clean_path, ref_param
+        );
+        let res = self.client.get(&url).send().await.ok()?;
+        if !res.status().is_success() {
+            return None;
+        }
+        let item = res.json::<ContentItem>().await.ok()?;
+        if let (Some(content), Some(encoding)) = (item.content, item.encoding) {
+            if encoding == "base64" {
+                let clean = content.replace('\n', "").replace('\r', "");
+                use base64::Engine;
+                return base64::engine::general_purpose::STANDARD.decode(clean).ok();
+            }
+        }
+        if let Some(dl) = item.download_url {
+            let res = self.client.get(&dl).send().await.ok()?;
+            return res.bytes().await.ok().map(|b| b.to_vec());
+        }
+        None
+    }
+}
+
+fn urlencoding(s: &str) -> String {
+    let mut encoded = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' || b == b'~' {
+            encoded.push(b as char);
+        } else {
+            encoded.push_str(&format!("%{:02X}", b));
+        }
+    }
+    encoded
+}
