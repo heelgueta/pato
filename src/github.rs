@@ -120,6 +120,11 @@ struct SearchUsersResponse {
     pub items: Vec<SearchUserItem>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SearchReposResponse {
+    pub items: Vec<RepoItem>,
+}
+
 impl GitHubClient {
     pub fn new() -> Self {
         // Zero-config token retrieval from environment or official `gh` CLI
@@ -229,6 +234,18 @@ impl GitHubClient {
         Ok(resp.items)
     }
 
+    pub async fn search_repos(&self, query: &str) -> Result<Vec<RepoItem>, String> {
+        let url = format!(
+            "https://api.github.com/search/repositories?q={}&per_page=10",
+            urlencoding(query)
+        );
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        let resp = res.json::<SearchReposResponse>().await.map_err(|e| e.to_string())?;
+        Ok(resp.items)
+    }
+
     /// Fetches a specific repository by "owner/name"
     pub async fn get_single_repo(&self, owner: &str, repo: &str) -> Result<RepoItem, String> {
         let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
@@ -302,7 +319,13 @@ impl GitHubClient {
         }
     }
 
-    pub async fn get_branches(&self, owner: &str, repo: &str) -> Result<Vec<String>, String> {
+    /// Fetches repository branches, sorted with master/main at the top followed by case-insensitive A-Z
+    pub async fn get_branches(
+        &self,
+        owner: &str,
+        repo: &str,
+        default_branch: Option<&str>,
+    ) -> Result<Vec<String>, String> {
         let url = format!(
             "https://api.github.com/repos/{}/{}/branches?per_page=100",
             owner, repo
@@ -311,7 +334,34 @@ impl GitHubClient {
         self.rate_limit.update_from_headers(res.headers());
         let res = res.error_for_status().map_err(|e| e.to_string())?;
         let branches = res.json::<Vec<BranchItem>>().await.map_err(|e| e.to_string())?;
-        Ok(branches.into_iter().map(|b| b.name).collect())
+        let mut branch_names: Vec<String> = branches.into_iter().map(|b| b.name).collect();
+
+        // Sort branches: master at top, main second, default_branch next, then case-insensitive A-Z
+        branch_names.sort_by(|a, b| {
+            let priority = |name: &str| -> u8 {
+                if name.eq_ignore_ascii_case("master") {
+                    0
+                } else if name.eq_ignore_ascii_case("main") {
+                    1
+                } else if let Some(def) = default_branch {
+                    if name.eq_ignore_ascii_case(def) {
+                        return 2;
+                    }
+                    3
+                } else {
+                    3
+                }
+            };
+            let pa = priority(a);
+            let pb = priority(b);
+            if pa != pb {
+                pa.cmp(&pb)
+            } else {
+                a.to_lowercase().cmp(&b.to_lowercase())
+            }
+        });
+
+        Ok(branch_names)
     }
 
     pub async fn get_repo_contents(

@@ -99,6 +99,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 AppEvent::BranchesLoaded { owner, repo, branches } => {
                     let key = format!("{}/{}", owner, repo);
+                    if let Some((ref o, ref r)) = app.branch_modal_repo {
+                        if o == &owner && r == &repo {
+                            if let Some(cur) = app.get_current_branch(&owner, &repo) {
+                                if let Some(pos) = branches.iter().position(|b| b == &cur) {
+                                    app.branch_modal_selected = pos;
+                                }
+                            }
+                        }
+                    }
                     app.branches_cache.insert(key, branches);
                 }
                 AppEvent::DirectoryLoaded {
@@ -157,7 +166,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Check user search debouncing
+        // Check user & repo search debouncing
         if let Some(timer) = user_search_timer {
             if tokio::time::Instant::now() >= timer {
                 let query = app.add_user_input.trim().to_string();
@@ -165,9 +174,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let client = Arc::clone(&app.client);
                     let event_tx = tx.clone();
                     tokio::spawn(async move {
-                        if let Ok(results) = client.search_users(&query).await {
-                            let _ = event_tx.send(AppEvent::SearchResultsLoaded { query, results });
+                        let mut suggestions = Vec::new();
+
+                        if query.contains('/') {
+                            // Query has slash, e.g. "owner/repo" -> search repositories
+                            if let Ok(repos) = client.search_repos(&query).await {
+                                for r in repos {
+                                    suggestions.push(app::SearchSuggestion::Repo {
+                                        full_name: r.full_name,
+                                        stars: r.stargazers_count,
+                                        language: r.language,
+                                    });
+                                }
+                            }
+                        } else {
+                            // Query without slash -> search both users and repositories concurrently
+                            let (users_res, repos_res) = tokio::join!(
+                                client.search_users(&query),
+                                client.search_repos(&query)
+                            );
+
+                            if let Ok(users) = users_res {
+                                for u in users.into_iter().take(4) {
+                                    suggestions.push(app::SearchSuggestion::User {
+                                        login: u.login,
+                                        user_type: u.user_type.unwrap_or_else(|| "User".into()),
+                                    });
+                                }
+                            }
+
+                            if let Ok(repos) = repos_res {
+                                for r in repos.into_iter().take(4) {
+                                    suggestions.push(app::SearchSuggestion::Repo {
+                                        full_name: r.full_name,
+                                        stars: r.stargazers_count,
+                                        language: r.language,
+                                    });
+                                }
+                            }
                         }
+
+                        let _ = event_tx.send(AppEvent::SearchResultsLoaded { query, results: suggestions });
                     });
                 }
                 user_search_timer = None;
@@ -253,7 +300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             KeyCode::Enter => {
                                 let name = if !app.search_results.is_empty() && app.search_selected < app.search_results.len() {
-                                    app.search_results[app.search_selected].login.clone()
+                                    app.search_results[app.search_selected].value().to_string()
                                 } else {
                                     app.add_user_input.clone()
                                 };

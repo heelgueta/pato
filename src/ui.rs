@@ -178,7 +178,7 @@ fn render_header(f: &mut Frame, app: &App, area: Rect) {
         NavigationLevel::Accounts => " 🦆 pato  /  [Accounts]".to_string(),
         NavigationLevel::Repos { owner, .. } => format!(" 🦆 pato  /  {}", owner),
         NavigationLevel::Directory { owner, repo, path } => {
-            let branch = app.get_current_branch(owner, repo);
+            let branch = app.get_non_main_branch(owner, repo);
             let b_tag = branch.map(|b| format!(" ({})", b)).unwrap_or_default();
             if path.is_empty() {
                 format!(" 🦆 pato  /  {}  /  {}{}", owner, repo, b_tag)
@@ -408,7 +408,7 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
                             "".to_string()
                         };
 
-                        let active_br = app.get_current_branch(owner, &repo.name);
+                        let active_br = app.get_non_main_branch(owner, &repo.name);
                         let br_tag = active_br.map(|b| format!(" ({})", b)).unwrap_or_default();
 
                         let line = Line::from(vec![
@@ -668,14 +668,16 @@ fn render_right_pane(f: &mut Frame, app: &App, highlighter: &SyntaxHighlighter, 
             f.render_widget(p, area);
         }
         Some(PreviewContent::Repo { repo, readme }) => {
-            let cur_branch = app.get_current_branch(&repo.full_name.split('/').next().unwrap_or(""), &repo.name);
-            let br_display = cur_branch.unwrap_or_else(|| repo.default_branch.clone().unwrap_or_else(|| "main".into()));
+            let non_main = app.get_non_main_branch(&repo.full_name.split('/').next().unwrap_or(""), &repo.name);
+            let br_display = non_main
+                .map(|b| format!("  [Branch: {}] (b to switch)", b))
+                .unwrap_or_else(|| "  (b to switch branch)".into());
 
             let mut lines = vec![
                 Line::from(vec![
                     Span::styled("📁 ", Style::default()),
                     Span::styled(&repo.full_name, Style::default().fg(FG).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("  [Branch: {}] (b to switch)", br_display), Style::default().fg(DIM)),
+                    Span::styled(br_display, Style::default().fg(DIM)),
                 ]),
                 Line::from(""),
                 Line::from(vec![
@@ -958,22 +960,44 @@ fn render_user_search_modal(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(app.add_user_input.trim(), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
         ]));
     } else if !app.search_results.is_empty() {
-        lines.push(Line::from(Span::styled("Search suggestions (Tab/Up/Down to select, Enter to load):", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled("Suggestions (Tab/Up/Down to select, Enter to load/save):", Style::default().fg(DIM))));
         for (i, item) in app.search_results.iter().enumerate().take(6) {
             let is_sel = i == app.search_selected;
-            let type_tag = item.user_type.as_deref().unwrap_or("User");
-            let line = if is_sel {
-                Line::from(vec![
-                    Span::styled(" ▶ ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!("{} ", item.login), Style::default().fg(BG).bg(FG).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" ({})", type_tag), Style::default().fg(DIM)),
-                ])
-            } else {
-                Line::from(vec![
-                    Span::raw("   "),
-                    Span::styled(format!("{} ", item.login), Style::default().fg(FG)),
-                    Span::styled(format!(" ({})", type_tag), Style::default().fg(DIM)),
-                ])
+            let line = match item {
+                crate::app::SearchSuggestion::User { login, user_type } => {
+                    if is_sel {
+                        Line::from(vec![
+                            Span::styled(" ▶ ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!("👤 {} ", login), Style::default().fg(BG).bg(FG).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!("({})", user_type), Style::default().fg(DIM)),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw("   👤 "),
+                            Span::styled(format!("{} ", login), Style::default().fg(FG)),
+                            Span::styled(format!("({})", user_type), Style::default().fg(DIM)),
+                        ])
+                    }
+                }
+                crate::app::SearchSuggestion::Repo { full_name, stars, language } => {
+                    let lang_tag = language.as_deref().map(|l| format!(" [{}]", l)).unwrap_or_default();
+                    let star_tag = format!(" ⭐ {}", stars);
+                    if is_sel {
+                        Line::from(vec![
+                            Span::styled(" ▶ ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                            Span::styled(format!("📦 {} ", full_name), Style::default().fg(BG).bg(FG).add_modifier(Modifier::BOLD)),
+                            Span::styled(star_tag, Style::default().fg(DIM)),
+                            Span::styled(lang_tag, Style::default().fg(DIM)),
+                        ])
+                    } else {
+                        Line::from(vec![
+                            Span::raw("   📦 "),
+                            Span::styled(format!("{} ", full_name), Style::default().fg(FG)),
+                            Span::styled(star_tag, Style::default().fg(DIM)),
+                            Span::styled(lang_tag, Style::default().fg(DIM)),
+                        ])
+                    }
+                }
             };
             lines.push(line);
         }

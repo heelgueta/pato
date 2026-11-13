@@ -1,4 +1,4 @@
-use crate::github::{ContentItem, GitHubClient, OrgItem, RepoItem, SearchUserItem, UserInfo};
+use crate::github::{ContentItem, GitHubClient, OrgItem, RepoItem, UserInfo};
 use ratatui::widgets::ListState;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -91,6 +91,29 @@ pub struct SavedBookmark {
     pub is_file: bool,
 }
 
+/// Autocomplete suggestions in search dialog: can be user/org or repository
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SearchSuggestion {
+    User {
+        login: String,
+        user_type: String,
+    },
+    Repo {
+        full_name: String,
+        stars: u64,
+        language: Option<String>,
+    },
+}
+
+impl SearchSuggestion {
+    pub fn value(&self) -> &str {
+        match self {
+            SearchSuggestion::User { login, .. } => login.as_str(),
+            SearchSuggestion::Repo { full_name, .. } => full_name.as_str(),
+        }
+    }
+}
+
 #[allow(dead_code)]
 pub enum AppEvent {
     InitialDataLoaded {
@@ -122,7 +145,7 @@ pub enum AppEvent {
     },
     SearchResultsLoaded {
         query: String,
-        results: Vec<SearchUserItem>,
+        results: Vec<SearchSuggestion>,
     },
     ActiveJobFinished(String),
     Error(String),
@@ -215,7 +238,7 @@ pub struct App {
     // Adding/searching user dialog
     pub is_adding_user: bool,
     pub add_user_input: String,
-    pub search_results: Vec<SearchUserItem>,
+    pub search_results: Vec<SearchSuggestion>,
     pub search_selected: usize,
 
     // Branch switching dialog
@@ -511,10 +534,49 @@ impl App {
     pub fn get_current_branch(&self, owner: &str, repo: &str) -> Option<String> {
         let key = format!("{}/{}", owner, repo);
         self.active_branch.get(&key).cloned().or_else(|| {
-            self.repos_cache.get(owner).and_then(|list| {
-                list.iter().find(|r| r.name == repo).and_then(|r| r.default_branch.clone())
-            })
+            self.get_repo_default_branch(owner, repo)
         })
+    }
+
+    /// Looks up repository default branch from cache or preview
+    pub fn get_repo_default_branch(&self, owner: &str, repo: &str) -> Option<String> {
+        if let Some(list) = self.repos_cache.get(owner) {
+            if let Some(r) = list.iter().find(|r| r.name.eq_ignore_ascii_case(repo)) {
+                return r.default_branch.clone();
+            }
+        }
+        for content in self.preview_cache.values() {
+            if let PreviewContent::Repo { repo: r, .. } = content {
+                if r.name.eq_ignore_ascii_case(repo) {
+                    return r.default_branch.clone();
+                }
+            }
+        }
+        None
+    }
+
+    /// Checks if a branch is non-main (i.e. not "main", not "master", and not repo's default branch)
+    pub fn is_non_main_branch(&self, owner: &str, repo: &str, branch: &str) -> bool {
+        let b = branch.trim();
+        if b.is_empty() || b.eq_ignore_ascii_case("main") || b.eq_ignore_ascii_case("master") {
+            return false;
+        }
+        if let Some(def) = self.get_repo_default_branch(owner, repo) {
+            if b.eq_ignore_ascii_case(&def) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Returns active branch ONLY if user has chosen a non-main / non-default branch
+    pub fn get_non_main_branch(&self, owner: &str, repo: &str) -> Option<String> {
+        let br = self.get_current_branch(owner, repo)?;
+        if self.is_non_main_branch(owner, repo, &br) {
+            Some(br)
+        } else {
+            None
+        }
     }
 
     pub fn set_current_branch(&mut self, owner: &str, repo: &str, branch: String) {
@@ -546,11 +608,18 @@ impl App {
         self.is_switching_branch = true;
 
         let repo_key = format!("{}/{}", owner, repo);
-        if !self.branches_cache.contains_key(&repo_key) {
+        if let Some(branches) = self.branches_cache.get(&repo_key) {
+            if let Some(cur) = self.get_current_branch(&owner, &repo) {
+                if let Some(pos) = branches.iter().position(|b| b == &cur) {
+                    self.branch_modal_selected = pos;
+                }
+            }
+        } else {
             let client = Arc::clone(&self.client);
             let tx = self.tx.clone();
+            let def_br = self.get_repo_default_branch(&owner, &repo);
             tokio::spawn(async move {
-                if let Ok(branches) = client.get_branches(&owner, &repo).await {
+                if let Ok(branches) = client.get_branches(&owner, &repo, def_br.as_deref()).await {
                     let _ = tx.send(AppEvent::BranchesLoaded {
                         owner,
                         repo,
