@@ -1,8 +1,9 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::process::Command;
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 use std::sync::Arc;
 
+/// RateLimitState tracks GitHub API limits from response headers (x-ratelimit-*)
 #[derive(Debug, Default)]
 pub struct RateLimitState {
     pub limit: AtomicU32,
@@ -30,6 +31,7 @@ impl RateLimitState {
     }
 }
 
+/// Asynchronous GitHub client with auto token retrieval via `gh auth token` or `GITHUB_TOKEN`
 #[derive(Debug, Clone)]
 pub struct GitHubClient {
     client: reqwest::Client,
@@ -63,7 +65,7 @@ pub struct OrgItem {
     pub role: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoItem {
     pub name: String,
     pub full_name: String,
@@ -89,6 +91,7 @@ pub struct BranchItem {
     pub name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct ContentItem {
     pub name: String,
@@ -103,6 +106,7 @@ pub struct ContentItem {
     pub encoding: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Deserialize)]
 pub struct SearchUserItem {
     pub login: String,
@@ -118,6 +122,7 @@ struct SearchUsersResponse {
 
 impl GitHubClient {
     pub fn new() -> Self {
+        // Zero-config token retrieval from environment or official `gh` CLI
         let token = std::env::var("GITHUB_TOKEN").ok().or_else(|| {
             let output = Command::new("gh").args(["auth", "token"]).output().ok()?;
             if output.status.success() {
@@ -224,7 +229,16 @@ impl GitHubClient {
         Ok(resp.items)
     }
 
-    // Helper for auto-paginating up to max_items (1,000) using RFC 5988 Link headers
+    /// Fetches a specific repository by "owner/name"
+    pub async fn get_single_repo(&self, owner: &str, repo: &str) -> Result<RepoItem, String> {
+        let url = format!("https://api.github.com/repos/{}/{}", owner, repo);
+        let res = self.client.get(&url).send().await.map_err(|e| e.to_string())?;
+        self.rate_limit.update_from_headers(res.headers());
+        let res = res.error_for_status().map_err(|e| e.to_string())?;
+        res.json::<RepoItem>().await.map_err(|e| e.to_string())
+    }
+
+    // Auto-paginating up to max_items (1,000) using RFC 5988 Link headers
     async fn paginate_repos(&self, initial_url: String, max_items: usize) -> Result<Vec<RepoItem>, String> {
         let mut all_repos = Vec::new();
         let mut next_url = Some(initial_url);

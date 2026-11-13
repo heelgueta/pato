@@ -28,8 +28,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new(tx.clone());
     let highlighter = SyntaxHighlighter::new();
 
-    // Load auto-remembered accounts from ~/.config/pato/saved_accounts.json
-    app.load_saved_accounts();
+    // Load auto-remembered accounts & bookmarks from ~/.config/pato/
+    app.load_saved_data();
 
     // Initial load: current user & organizations (if authenticated)
     if app.client.is_authenticated() {
@@ -78,6 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     new_accounts.push(AccountEntry::AddNew);
                     app.accounts = new_accounts;
+                    app.rebuild_accounts_list_with_bookmarks();
                     app.current_user = current_user;
                     app.restore_cursor_for_current_level();
                     app.trigger_preview_fetch();
@@ -88,6 +89,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     app.repos_cache.insert(owner.clone(), repos);
                     app.restore_cursor_for_current_level();
                     app.trigger_preview_fetch();
+                }
+                AppEvent::SingleRepoLoaded { repo } => {
+                    let owner = repo.full_name.split('/').next().unwrap_or("").to_string();
+                    let entry = app.repos_cache.entry(owner).or_default();
+                    if !entry.iter().any(|r| r.name == repo.name) {
+                        entry.push(repo);
+                    }
                 }
                 AppEvent::BranchesLoaded { owner, repo, branches } => {
                     let key = format!("{}/{}", owner, repo);
@@ -253,7 +261,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 app.add_user_input.clear();
                                 app.search_results.clear();
                                 if !name.trim().is_empty() {
-                                    app.add_custom_user(name);
+                                    app.add_custom_user_or_repo(name);
                                 }
                             }
                             KeyCode::Backspace => {
@@ -332,6 +340,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Char('b') => {
                             app.open_branch_switcher();
+                        }
+                        KeyCode::Char('m') => {
+                            app.toggle_bookmark_current_repo();
+                        }
+                        KeyCode::Char('#') => {
+                            app.show_line_numbers = !app.show_line_numbers;
+                            let state = if app.show_line_numbers { "ON" } else { "OFF" };
+                            app.set_status(format!("Line numbers: {}", state));
                         }
                         KeyCode::Char('r') => {
                             app.remove_selected_account();

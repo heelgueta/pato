@@ -57,6 +57,90 @@ impl SyntaxHighlighter {
     }
 }
 
+// ─── Native Markdown & Byte Format Helpers ───────────────────────────────
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
+fn render_markdown(text: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut in_code_block = false;
+
+    for raw_line in text.lines() {
+        let trimmed = raw_line.trim_start();
+        if trimmed.starts_with("```") {
+            in_code_block = !in_code_block;
+            let lang = trimmed.trim_start_matches('`').trim();
+            let label = if in_code_block {
+                if lang.is_empty() {
+                    " ┌── [code] ".to_string()
+                } else {
+                    format!(" ┌── [{}] ", lang)
+                }
+            } else {
+                " └──".to_string()
+            };
+            lines.push(Line::from(Span::styled(label, Style::default().fg(DIM))));
+            continue;
+        }
+
+        if in_code_block {
+            lines.push(Line::from(vec![
+                Span::styled(" │ ", Style::default().fg(DIM)),
+                Span::styled(raw_line.to_string(), Style::default().fg(FG)),
+            ]));
+            continue;
+        }
+
+        if let Some(h) = trimmed.strip_prefix("# ") {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                h.to_string(),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD | Modifier::UNDERLINED),
+            )));
+        } else if let Some(h) = trimmed.strip_prefix("## ") {
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                h.to_string(),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(h) = trimmed.strip_prefix("### ") {
+            lines.push(Line::from(Span::styled(
+                format!("▶ {}", h),
+                Style::default().fg(FG).add_modifier(Modifier::BOLD),
+            )));
+        } else if let Some(h) = trimmed.strip_prefix("#### ") {
+            lines.push(Line::from(Span::styled(
+                format!("• {}", h),
+                Style::default().fg(DIM).add_modifier(Modifier::BOLD),
+            )));
+        } else if trimmed.starts_with("- ") || trimmed.starts_with("* ") {
+            let item = &trimmed[2..];
+            lines.push(Line::from(vec![
+                Span::styled("  • ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                Span::styled(item.to_string(), Style::default().fg(FG)),
+            ]));
+        } else if let Some(quote) = trimmed.strip_prefix("> ") {
+            lines.push(Line::from(vec![
+                Span::styled("  │ ", Style::default().fg(DIM)),
+                Span::styled(quote.to_string(), Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
+            ]));
+        } else if trimmed.starts_with("---") || trimmed.starts_with("***") {
+            lines.push(Line::from(Span::styled("────────────────────────────", Style::default().fg(DIM))));
+        } else {
+            lines.push(Line::from(Span::styled(raw_line.to_string(), Style::default().fg(FG))));
+        }
+    }
+
+    lines
+}
+
 pub fn render_ui(f: &mut Frame, app: &mut App, highlighter: &SyntaxHighlighter) {
     let size = f.area();
 
@@ -171,14 +255,15 @@ fn render_left_pane(f: &mut Frame, app: &App, area: Rect) {
         NavigationLevel::Repos { owner, .. } => {
             app.accounts
                 .iter()
-                .filter(|a| !matches!(a, AccountEntry::AddNew))
+                .filter(|a| !matches!(a, AccountEntry::AddNew | AccountEntry::SavedReposSection))
                 .map(|acc| {
                     let is_active = acc.name() == owner;
                     let icon = match acc {
                         AccountEntry::User(_) => "👤",
                         AccountEntry::Org(_) => "🏢",
                         AccountEntry::Custom(_) => "🌐",
-                        AccountEntry::AddNew => "+",
+                        AccountEntry::SavedRepo(_, _) => "⭐",
+                        AccountEntry::SavedReposSection | AccountEntry::AddNew => "+",
                     };
                     let st = if is_active {
                         Style::default().fg(FG).add_modifier(Modifier::BOLD)
@@ -270,6 +355,18 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
                                 Span::styled(&o.login, Style::default().fg(FG)),
                             ])));
                         }
+                        AccountEntry::SavedReposSection => {
+                            list_items.push(ListItem::new(Line::from(vec![
+                                Span::styled("⭐ SAVED REPOSITORIES", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)),
+                            ])));
+                        }
+                        AccountEntry::SavedRepo(owner, repo) => {
+                            list_items.push(ListItem::new(Line::from(vec![
+                                Span::styled("⭐ ", Style::default().fg(FG)),
+                                Span::styled(format!("{}/{}", owner, repo), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                                Span::styled(" (saved repo)", Style::default().fg(DIM)),
+                            ])));
+                        }
                         AccountEntry::Custom(name) => {
                             list_items.push(ListItem::new(Line::from(vec![
                                 Span::styled("🌐 ", Style::default().fg(DIM)),
@@ -279,7 +376,7 @@ fn render_middle_pane(f: &mut Frame, app: &mut App, area: Rect) {
                         }
                         AccountEntry::AddNew => {
                             list_items.push(ListItem::new(Line::from(vec![
-                                Span::styled("+ Other user/org...", Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
+                                Span::styled("+ Other user/org/repo...", Style::default().fg(DIM).add_modifier(Modifier::ITALIC)),
                             ])));
                         }
                     }
@@ -424,12 +521,10 @@ fn render_right_pane(f: &mut Frame, app: &App, highlighter: &SyntaxHighlighter, 
             indices
                 .get(app.selected_index())
                 .and_then(|&idx| app.accounts.get(idx))
-                .and_then(|acc| {
-                    if matches!(acc, AccountEntry::AddNew) {
-                        None
-                    } else {
-                        Some(format!("acc:{}", acc.name()))
-                    }
+                .and_then(|acc| match acc {
+                    AccountEntry::AddNew | AccountEntry::SavedReposSection => None,
+                    AccountEntry::SavedRepo(owner, repo) => Some(format!("repo:{}/{}", owner, repo)),
+                    _ => Some(format!("acc:{}", acc.name())),
                 })
         }
         NavigationLevel::Repos { owner, .. } => {
@@ -604,9 +699,8 @@ fn render_right_pane(f: &mut Frame, app: &App, highlighter: &SyntaxHighlighter, 
 
             if let Some(rm) = readme {
                 lines.push(Line::from(Span::styled("📖 README.md:", Style::default().fg(FG).add_modifier(Modifier::BOLD))));
-                for line in rm.lines() {
-                    lines.push(Line::from(Span::styled(line, Style::default().fg(FG))));
-                }
+                lines.push(Line::from(""));
+                lines.extend(render_markdown(rm));
             } else {
                 lines.push(Line::from(Span::styled("No README.md found.", Style::default().fg(DIM))));
             }
@@ -693,14 +787,76 @@ fn render_right_pane(f: &mut Frame, app: &App, highlighter: &SyntaxHighlighter, 
             let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
             f.render_widget(p, area);
         }
-        Some(PreviewContent::File { name, content, is_binary }) => {
+        Some(PreviewContent::File {
+            name,
+            content,
+            is_binary,
+            lines_count,
+            size_bytes,
+            syntax_name,
+        }) => {
             if *is_binary {
-                let p = Paragraph::new("Binary file preview is omitted. Press 'd' to download.")
-                    .block(block)
-                    .style(Style::default().fg(DIM));
+                let lines = vec![
+                    Line::from(vec![
+                        Span::styled("⚠️ Binary File: ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                        Span::styled(name, Style::default().fg(FG)),
+                    ]),
+                    Line::from(""),
+                    Line::from(vec![
+                        Span::styled("Size: ", Style::default().fg(DIM)),
+                        Span::styled(format_bytes(*size_bytes), Style::default().fg(FG)),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Binary file preview is omitted.", Style::default().fg(DIM))),
+                    Line::from(vec![
+                        Span::styled("Press 'd' ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!("to download directly into {}", app.start_dir.display()), Style::default().fg(DIM)),
+                    ]),
+                ];
+                let p = Paragraph::new(lines).block(block).wrap(Wrap { trim: true });
                 f.render_widget(p, area);
             } else {
-                let lines = highlighter.highlight(name, content);
+                let is_markdown = name.to_lowercase().ends_with(".md");
+                let mut lines = Vec::new();
+
+                // Top file metadata summary bar
+                let meta_line = Line::from(vec![
+                    Span::styled(format!(" 📄 {} ", name), Style::default().fg(FG).add_modifier(Modifier::BOLD).bg(PANEL)),
+                    Span::styled("│ ", Style::default().fg(DIM).bg(PANEL)),
+                    Span::styled(format!("{} lines ", lines_count), Style::default().fg(DIM).bg(PANEL)),
+                    Span::styled("│ ", Style::default().fg(DIM).bg(PANEL)),
+                    Span::styled(format!("{} ", format_bytes(*size_bytes)), Style::default().fg(DIM).bg(PANEL)),
+                    Span::styled("│ ", Style::default().fg(DIM).bg(PANEL)),
+                    Span::styled(format!("{} ", syntax_name), Style::default().fg(FG).bg(PANEL)),
+                    Span::styled(
+                        if app.show_line_numbers { " [# lines: ON] " } else { " [# lines: OFF] " },
+                        Style::default().fg(DIM).bg(PANEL),
+                    ),
+                ]);
+                lines.push(meta_line);
+                lines.push(Line::from(""));
+
+                if is_markdown && !app.show_line_numbers {
+                    lines.extend(render_markdown(content));
+                } else {
+                    let highlighted = highlighter.highlight(name, content);
+                    let gutter_width = format!("{}", lines_count).len().max(3);
+
+                    for (idx, h_line) in highlighted.into_iter().enumerate() {
+                        if app.show_line_numbers {
+                            let mut spans = Vec::with_capacity(h_line.spans.len() + 1);
+                            spans.push(Span::styled(
+                                format!("{:>width$} │ ", idx + 1, width = gutter_width),
+                                Style::default().fg(DIM),
+                            ));
+                            spans.extend(h_line.spans);
+                            lines.push(Line::from(spans));
+                        } else {
+                            lines.push(h_line);
+                        }
+                    }
+                }
+
                 let p = Paragraph::new(lines)
                     .block(block)
                     .scroll((app.preview_scroll as u16, 0));
@@ -737,26 +893,32 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
             Span::styled(" ? ", Style::default().fg(BG).bg(FG).add_modifier(Modifier::BOLD)),
             Span::styled(" help", Style::default().fg(DIM)),
             Span::raw("   "),
-            Span::styled("hjkl / arrows", Style::default().fg(FG)),
+            Span::styled("arrows/hjkl", Style::default().fg(FG)),
             Span::styled(":nav ", Style::default().fg(DIM)),
+            Span::styled("m", Style::default().fg(FG)),
+            Span::styled(":bookmark ", Style::default().fg(DIM)),
+            Span::styled("#", Style::default().fg(FG)),
+            Span::styled(":lines ", Style::default().fg(DIM)),
             Span::styled("b", Style::default().fg(FG)),
             Span::styled(":branch ", Style::default().fg(DIM)),
             Span::styled("c", Style::default().fg(FG)),
             Span::styled(":clone ", Style::default().fg(DIM)),
             Span::styled("C", Style::default().fg(FG)),
-            Span::styled(":copy-clone-url ", Style::default().fg(DIM)),
+            Span::styled(":copy ", Style::default().fg(DIM)),
             Span::styled("d", Style::default().fg(FG)),
-            Span::styled(":download ", Style::default().fg(DIM)),
+            Span::styled(":dl ", Style::default().fg(DIM)),
             Span::styled("D", Style::default().fg(FG)),
-            Span::styled(":copy-url ", Style::default().fg(DIM)),
+            Span::styled(":url ", Style::default().fg(DIM)),
             Span::styled("r", Style::default().fg(FG)),
-            Span::styled(":remove-saved ", Style::default().fg(DIM)),
+            Span::styled(":rm ", Style::default().fg(DIM)),
             Span::styled("R", Style::default().fg(FG)),
-            Span::styled(":refresh ", Style::default().fg(DIM)),
+            Span::styled(":sync ", Style::default().fg(DIM)),
             Span::styled("s", Style::default().fg(FG)),
             Span::styled(":sort ", Style::default().fg(DIM)),
+            Span::styled("u", Style::default().fg(FG)),
+            Span::styled(":add ", Style::default().fg(DIM)),
             Span::styled("/", Style::default().fg(FG)),
-            Span::styled(":filter ", Style::default().fg(DIM)),
+            Span::styled(":find ", Style::default().fg(DIM)),
             Span::styled("q", Style::default().fg(FG)),
             Span::styled(":quit", Style::default().fg(DIM)),
         ])
@@ -767,7 +929,7 @@ fn render_status_line(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_user_search_modal(f: &mut Frame, app: &App, area: Rect) {
-    let popup_area = centered_rect(60, 45, area);
+    let popup_area = centered_rect(60, 48, area);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -775,10 +937,12 @@ fn render_user_search_modal(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BORDER_TYPE)
         .border_style(Style::default().fg(ACCENT))
         .style(Style::default().bg(PANEL))
-        .title(Span::styled(" Explore Public User / Organization ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+        .title(Span::styled(" Explore & Remember User / Org / Repo ", Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)));
+
+    let is_repo_input = app.add_user_input.contains('/');
 
     let mut lines = vec![
-        Line::from("Type exact username/org, or type to search GitHub:"),
+        Line::from("Type exact username/org, or 'owner/repo' to save a repository directly:"),
         Line::from(""),
         Line::from(vec![
             Span::styled("> ", Style::default().fg(FG).add_modifier(Modifier::BOLD)),
@@ -788,7 +952,12 @@ fn render_user_search_modal(f: &mut Frame, app: &App, area: Rect) {
         Line::from(""),
     ];
 
-    if !app.search_results.is_empty() {
+    if is_repo_input {
+        lines.push(Line::from(vec![
+            Span::styled("⭐ Press Enter to save bookmark for repository: ", Style::default().fg(FG)),
+            Span::styled(app.add_user_input.trim(), Style::default().fg(FG).add_modifier(Modifier::BOLD)),
+        ]));
+    } else if !app.search_results.is_empty() {
         lines.push(Line::from(Span::styled("Search suggestions (Tab/Up/Down to select, Enter to load):", Style::default().fg(DIM))));
         for (i, item) in app.search_results.iter().enumerate().take(6) {
             let is_sel = i == app.search_selected;
@@ -809,7 +978,7 @@ fn render_user_search_modal(f: &mut Frame, app: &App, area: Rect) {
             lines.push(line);
         }
     } else if !app.add_user_input.is_empty() {
-        lines.push(Line::from(Span::styled("Press Enter to explore this exact username/org directly", Style::default().fg(DIM))));
+        lines.push(Line::from(Span::styled("Press Enter to explore this username/org directly", Style::default().fg(DIM))));
     }
 
     lines.push(Line::from(""));
@@ -876,7 +1045,7 @@ fn render_branch_modal(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_help_modal(f: &mut Frame, area: Rect) {
-    let popup_area = centered_rect(58, 68, area);
+    let popup_area = centered_rect(62, 74, area);
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()
@@ -888,18 +1057,20 @@ fn render_help_modal(f: &mut Frame, area: Rect) {
 
     let keys = vec![
         ("hjkl / Arrows", "Navigate lists & step into / back"),
-        ("J / K", "Scroll preview pane down / up"),
-        ("/", "Fuzzy / substring filter in list"),
-        ("b", "Switch branch for current repo (choose from available remote branches)"),
-        ("s", "Cycle repo sort (Updated / Created / A-Z / Status / Archived / Fork / Lang)"),
-        ("c", "Git clone selected repo into launch folder"),
+        ("J / K", "Scroll preview pane down / up (5 lines)"),
+        ("#", "Toggle line numbers on code files (ON / OFF)"),
+        ("m", "Bookmark / save current repo (or remove bookmark)"),
+        ("r", "Remove saved custom user/org or saved repo from list"),
+        ("b", "Switch branch for current repo (remote branches)"),
+        ("s", "Cycle repo sort (Updated/Created/A-Z/Status/Archived/Fork/Lang)"),
+        ("c", "Git clone selected repo into launch directory"),
         ("C (Shift+c)", "Copy clone URL (.git) to system clipboard"),
-        ("d", "Download selected file into current launch folder"),
-        ("D (Shift+d)", "Copy Web URL of selected repo, account, or file to clipboard"),
-        ("r", "Remove saved custom user/org from list"),
-        ("R (Shift+r)", "Refresh current level and re-fetch from GitHub"),
+        ("d", "Download selected file into current launch directory"),
+        ("D (Shift+d)", "Copy Web URL of selected repo, account, or file"),
         ("o", "Open repo / file / account in browser (xdg-open)"),
-        ("u", "Quick popup to explore and auto-remember any user/org"),
+        ("u", "Explore and save any user, org, or 'owner/repo'"),
+        ("R (Shift+r)", "Refresh current level and re-fetch from GitHub"),
+        ("/", "Filter / search current list"),
         ("?", "Toggle this keybindings guide"),
         ("q / Esc", "Quit or clear filter / close modal"),
     ];

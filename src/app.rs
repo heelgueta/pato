@@ -1,5 +1,6 @@
 use crate::github::{ContentItem, GitHubClient, OrgItem, RepoItem, SearchUserItem, UserInfo};
 use ratatui::widgets::ListState;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -7,6 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+/// Repository sorting options cycled with `s`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoSort {
     PushedDesc,
@@ -19,16 +21,6 @@ pub enum RepoSort {
 }
 
 impl RepoSort {
-    pub const ALL: [RepoSort; 7] = [
-        RepoSort::PushedDesc,
-        RepoSort::CreatedDesc,
-        RepoSort::NameAsc,
-        RepoSort::Status,
-        RepoSort::Archived,
-        RepoSort::Fork,
-        RepoSort::Language,
-    ];
-
     pub fn label(&self) -> &'static str {
         match self {
             RepoSort::PushedDesc => "Latest Updated",
@@ -54,6 +46,7 @@ impl RepoSort {
     }
 }
 
+/// Miller-column navigation levels
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NavigationLevel {
     Accounts,
@@ -61,12 +54,15 @@ pub enum NavigationLevel {
     Directory { owner: String, repo: String, path: String },
 }
 
+/// Account & saved repository root entries
 #[derive(Debug, Clone)]
 pub enum AccountEntry {
     User(UserInfo),
     Org(OrgItem),
-    Custom(String),
-    AddNew,
+    SavedReposSection,            // Section header: "⭐ Saved Repositories"
+    SavedRepo(String, String),    // (owner, repo_name)
+    Custom(String),               // Saved user or org handle
+    AddNew,                       // "+ Other user/org/repo..."
 }
 
 impl AccountEntry {
@@ -74,8 +70,10 @@ impl AccountEntry {
         match self {
             AccountEntry::User(u) => &u.login,
             AccountEntry::Org(o) => &o.login,
+            AccountEntry::SavedReposSection => "⭐ Saved Repositories",
+            AccountEntry::SavedRepo(_owner, repo) => repo.as_str(),
             AccountEntry::Custom(s) => s.as_str(),
-            AccountEntry::AddNew => "+ Other user/org...",
+            AccountEntry::AddNew => "+ Other user/org/repo...",
         }
     }
 
@@ -84,6 +82,16 @@ impl AccountEntry {
     }
 }
 
+/// Saved bookmark reference (saved to ~/.config/pato/saved_items.json)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedBookmark {
+    pub owner: String,
+    pub repo: String,
+    pub path: Option<String>,      // None if bookmark is an entire repo
+    pub is_file: bool,
+}
+
+#[allow(dead_code)]
 pub enum AppEvent {
     InitialDataLoaded {
         current_user: Option<UserInfo>,
@@ -92,6 +100,9 @@ pub enum AppEvent {
     ReposLoaded {
         owner: String,
         repos: Vec<RepoItem>,
+    },
+    SingleRepoLoaded {
+        repo: RepoItem,
     },
     BranchesLoaded {
         owner: String,
@@ -124,6 +135,7 @@ pub struct HalfBlockImage {
     pub pixels: Vec<(ratatui::style::Color, ratatui::style::Color)>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub enum PreviewContent {
     Loading,
@@ -138,6 +150,9 @@ pub enum PreviewContent {
         name: String,
         content: String,
         is_binary: bool,
+        lines_count: usize,
+        size_bytes: u64,
+        syntax_name: String,
     },
     Image {
         name: String,
@@ -148,7 +163,6 @@ pub enum PreviewContent {
     FileOversized {
         name: String,
         size: u64,
-        head_preview: Option<String>,
         raw_url: Option<String>,
     },
     Empty,
@@ -176,14 +190,20 @@ pub struct App {
     // Cursor position memory per level key (Yazi-style)
     pub cursor_history: HashMap<String, usize>,
 
-    // Generation token for dropping stale background preview responses
+    // Generation counter for dropping stale background preview responses
     pub preview_generation: Arc<AtomicU64>,
 
-    // Active background jobs indicator (e.g. "Cloning pato...", "Downloading index.js...")
+    // Active background job notification (e.g. "Cloning pato...", "Downloading index.js...")
     pub active_job: Option<String>,
 
     // Loading tracking
     pub loading_keys: HashMap<String, bool>,
+
+    // Saved Bookmarks / Stars (persisted in ~/.config/pato/saved_items.json)
+    pub saved_bookmarks: Vec<SavedBookmark>,
+
+    // Line number toggle for code files (default false, toggled with '#')
+    pub show_line_numbers: bool,
 
     // Sorting
     pub repo_sort: RepoSort,
@@ -237,6 +257,8 @@ impl App {
             preview_generation: Arc::new(AtomicU64::new(0)),
             active_job: None,
             loading_keys: HashMap::new(),
+            saved_bookmarks: Vec::new(),
+            show_line_numbers: false,
             repo_sort: RepoSort::PushedDesc,
             is_filtering: false,
             filter_query: String::new(),
@@ -285,16 +307,19 @@ impl App {
         self.list_state.select(Some(valid_idx));
     }
 
-    pub fn config_path() -> PathBuf {
+    pub fn config_dir() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         let dir = PathBuf::from(home).join(".config").join("pato");
         let _ = fs::create_dir_all(&dir);
-        dir.join("saved_accounts.json")
+        dir
     }
 
-    pub fn load_saved_accounts(&mut self) {
-        let path = Self::config_path();
-        if let Ok(content) = fs::read_to_string(&path) {
+    pub fn load_saved_data(&mut self) {
+        let dir = Self::config_dir();
+        
+        // 1. Load saved user & org accounts
+        let acc_path = dir.join("saved_accounts.json");
+        if let Ok(content) = fs::read_to_string(&acc_path) {
             if let Ok(saved) = serde_json::from_str::<Vec<String>>(&content) {
                 for name in saved {
                     let trimmed = name.trim().to_string();
@@ -307,10 +332,21 @@ impl App {
                 }
             }
         }
+
+        // 2. Load saved repo/file bookmarks
+        let bm_path = dir.join("saved_bookmarks.json");
+        if let Ok(content) = fs::read_to_string(&bm_path) {
+            if let Ok(saved) = serde_json::from_str::<Vec<SavedBookmark>>(&content) {
+                self.saved_bookmarks = saved;
+                self.rebuild_accounts_list_with_bookmarks();
+            }
+        }
     }
 
-    pub fn persist_saved_accounts(&self) {
-        let path = Self::config_path();
+    pub fn persist_saved_data(&self) {
+        let dir = Self::config_dir();
+
+        // 1. Persist accounts
         let custom_names: Vec<String> = self
             .accounts
             .iter()
@@ -320,7 +356,62 @@ impl App {
             })
             .collect();
         if let Ok(json) = serde_json::to_string_pretty(&custom_names) {
-            let _ = fs::write(path, json);
+            let _ = fs::write(dir.join("saved_accounts.json"), json);
+        }
+
+        // 2. Persist bookmarks
+        if let Ok(json) = serde_json::to_string_pretty(&self.saved_bookmarks) {
+            let _ = fs::write(dir.join("saved_bookmarks.json"), json);
+        }
+    }
+
+    pub fn rebuild_accounts_list_with_bookmarks(&mut self) {
+        // Strip previous bookmark sections from accounts list
+        self.accounts.retain(|a| !matches!(a, AccountEntry::SavedReposSection | AccountEntry::SavedRepo(_, _)));
+
+        if !self.saved_bookmarks.is_empty() {
+            let insert_pos = if self.accounts.is_empty() { 0 } else { self.accounts.len().saturating_sub(1) };
+            self.accounts.insert(insert_pos, AccountEntry::SavedReposSection);
+
+            for (i, bm) in self.saved_bookmarks.iter().enumerate() {
+                self.accounts.insert(insert_pos + 1 + i, AccountEntry::SavedRepo(bm.owner.clone(), bm.repo.clone()));
+            }
+        }
+    }
+
+    /// Toggle bookmarking current repository (press 'm' for mark / bookmark)
+    pub fn toggle_bookmark_current_repo(&mut self) {
+        let (owner, repo) = match &self.level {
+            NavigationLevel::Repos { owner, .. } => {
+                let sorted_repos = self.get_sorted_and_filtered_repos(owner);
+                if let Some((_, r)) = sorted_repos.get(self.selected_index()) {
+                    (owner.clone(), r.name.clone())
+                } else {
+                    return;
+                }
+            }
+            NavigationLevel::Directory { owner, repo, .. } => (owner.clone(), repo.clone()),
+            _ => {
+                self.set_status("Select a repository to bookmark/save");
+                return;
+            }
+        };
+
+        if let Some(pos) = self.saved_bookmarks.iter().position(|b| b.owner == owner && b.repo == repo && b.path.is_none()) {
+            self.saved_bookmarks.remove(pos);
+            self.rebuild_accounts_list_with_bookmarks();
+            self.persist_saved_data();
+            self.set_status(format!("Removed bookmark: {}/{}", owner, repo));
+        } else {
+            self.saved_bookmarks.push(SavedBookmark {
+                owner: owner.clone(),
+                repo: repo.clone(),
+                path: None,
+                is_file: false,
+            });
+            self.rebuild_accounts_list_with_bookmarks();
+            self.persist_saved_data();
+            self.set_status(format!("Saved bookmark ⭐ {}/{}", owner, repo));
         }
     }
 
@@ -329,18 +420,29 @@ impl App {
             let indices = self.filtered_account_indices();
             if let Some(&idx) = indices.get(self.selected_index()) {
                 if let Some(acc) = self.accounts.get(idx) {
-                    if let AccountEntry::Custom(name) = acc {
-                        let n = name.clone();
-                        self.accounts.remove(idx);
-                        self.persist_saved_accounts();
-                        self.set_status(format!("Removed saved user/org: {}", n));
-                        if self.selected_index() >= self.accounts.len().max(1) {
-                            self.list_state.select(Some(self.accounts.len().saturating_sub(1)));
+                    match acc {
+                        AccountEntry::Custom(name) => {
+                            let n = name.clone();
+                            self.accounts.remove(idx);
+                            self.persist_saved_data();
+                            self.set_status(format!("Removed saved user/org: {}", n));
+                            if self.selected_index() >= self.accounts.len().max(1) {
+                                self.list_state.select(Some(self.accounts.len().saturating_sub(1)));
+                            }
                         }
-                    } else if matches!(acc, AccountEntry::AddNew) {
-                        // ignore
-                    } else {
-                        self.set_status("Cannot remove authenticated owner or default org");
+                        AccountEntry::SavedRepo(owner, repo) => {
+                            let (o, r) = (owner.clone(), repo.clone());
+                            if let Some(pos) = self.saved_bookmarks.iter().position(|b| b.owner == o && b.repo == r) {
+                                self.saved_bookmarks.remove(pos);
+                                self.rebuild_accounts_list_with_bookmarks();
+                                self.persist_saved_data();
+                                self.set_status(format!("Removed saved repo: {}/{}", o, r));
+                            }
+                        }
+                        AccountEntry::SavedReposSection | AccountEntry::AddNew => {}
+                        _ => {
+                            self.set_status("Cannot remove authenticated owner or primary org");
+                        }
                     }
                 }
             }
@@ -464,7 +566,7 @@ impl App {
             .iter()
             .enumerate()
             .filter(|(_, acc)| {
-                if matches!(acc, AccountEntry::AddNew) {
+                if matches!(acc, AccountEntry::AddNew | AccountEntry::SavedReposSection) {
                     return true;
                 }
                 if self.filter_query.is_empty() {
@@ -560,6 +662,21 @@ impl App {
         if new_sel >= count as isize {
             new_sel = (count - 1) as isize;
         }
+
+        // If landing on section header, skip past it
+        if matches!(self.level, NavigationLevel::Accounts) {
+            let indices = self.filtered_account_indices();
+            if let Some(&idx) = indices.get(new_sel as usize) {
+                if matches!(self.accounts.get(idx), Some(AccountEntry::SavedReposSection)) {
+                    if delta > 0 && (new_sel + 1) < count as isize {
+                        new_sel += 1;
+                    } else if delta < 0 && (new_sel - 1) >= 0 {
+                        new_sel -= 1;
+                    }
+                }
+            }
+        }
+
         self.list_state.select(Some(new_sel as usize));
         self.save_current_cursor();
         self.preview_scroll = 0;
@@ -573,10 +690,30 @@ impl App {
                 let indices = self.filtered_account_indices();
                 if let Some(&idx) = indices.get(self.selected_index()) {
                     if let Some(acc) = self.accounts.get(idx) {
+                        if matches!(acc, AccountEntry::SavedReposSection) {
+                            return;
+                        }
+
                         if matches!(acc, AccountEntry::AddNew) {
                             self.is_adding_user = true;
                             self.add_user_input.clear();
                             self.search_results.clear();
+                            return;
+                        }
+
+                        // Direct jump into a saved repo
+                        if let AccountEntry::SavedRepo(owner, repo_name) = acc {
+                            let o = owner.clone();
+                            let r = repo_name.clone();
+                            self.level = NavigationLevel::Directory {
+                                owner: o.clone(),
+                                repo: r.clone(),
+                                path: String::new(),
+                            };
+                            self.filter_query.clear();
+                            self.preview_scroll = 0;
+                            self.restore_cursor_for_current_level();
+                            self.fetch_dir_if_needed(&o, &r, "");
                             return;
                         }
 
@@ -759,7 +896,34 @@ impl App {
                 let indices = self.filtered_account_indices();
                 if let Some(&idx) = indices.get(self.selected_index()) {
                     if let Some(acc) = self.accounts.get(idx) {
-                        if matches!(acc, AccountEntry::AddNew) {
+                        if matches!(acc, AccountEntry::AddNew | AccountEntry::SavedReposSection) {
+                            return;
+                        }
+
+                        // Preview for saved repo from root accounts list
+                        if let AccountEntry::SavedRepo(owner, repo) = acc {
+                            let key = format!("repo:{}/{}", owner, repo);
+                            if self.preview_cache.contains_key(&key) {
+                                return;
+                            }
+                            let client = Arc::clone(&self.client);
+                            let tx = self.tx.clone();
+                            let o = owner.clone();
+                            let r = repo.clone();
+                            tokio::spawn(async move {
+                                if let Ok(repo_item) = client.get_single_repo(&o, &r).await {
+                                    let readme = client.get_readme(&o, &r, None).await;
+                                    if gen_arc.load(Ordering::SeqCst) == current_gen {
+                                        let _ = tx.send(AppEvent::PreviewLoaded {
+                                            key,
+                                            content: PreviewContent::Repo {
+                                                repo: repo_item,
+                                                readme,
+                                            },
+                                        });
+                                    }
+                                }
+                            });
                             return;
                         }
 
@@ -869,7 +1033,6 @@ impl App {
                                                 content: PreviewContent::FileOversized {
                                                     name: item_clone.name,
                                                     size: item_clone.size,
-                                                    head_preview: None,
                                                     raw_url: item_clone.download_url,
                                                 },
                                             });
@@ -906,16 +1069,38 @@ impl App {
                                                         name: item_clone.name,
                                                         content: "Binary file preview is omitted.".into(),
                                                         is_binary: true,
+                                                        lines_count: 0,
+                                                        size_bytes: item_clone.size,
+                                                        syntax_name: "Binary".into(),
                                                     },
                                                 });
                                             } else {
                                                 let content = String::from_utf8_lossy(&raw_bytes).to_string();
+                                                let lines_count = content.lines().count();
+                                                let syntax_name = match ext.as_str() {
+                                                    "rs" => "Rust",
+                                                    "py" => "Python",
+                                                    "js" => "JavaScript",
+                                                    "ts" => "TypeScript",
+                                                    "md" => "Markdown",
+                                                    "json" => "JSON",
+                                                    "toml" => "TOML",
+                                                    "yaml" | "yml" => "YAML",
+                                                    "html" => "HTML",
+                                                    "css" => "CSS",
+                                                    "sh" | "bash" => "Shell",
+                                                    _ => "Plain Text",
+                                                }.to_string();
+
                                                 let _ = tx.send(AppEvent::PreviewLoaded {
                                                     key,
                                                     content: PreviewContent::File {
                                                         name: item_clone.name,
                                                         content,
                                                         is_binary: false,
+                                                        lines_count,
+                                                        size_bytes: item_clone.size,
+                                                        syntax_name,
                                                     },
                                                 });
                                             }
@@ -977,6 +1162,19 @@ impl App {
 
     pub fn clone_selected_repo(&mut self) {
         let (owner, repo_name) = match &self.level {
+            NavigationLevel::Accounts => {
+                let indices = self.filtered_account_indices();
+                if let Some(&idx) = indices.get(self.selected_index()) {
+                    if let Some(AccountEntry::SavedRepo(o, r)) = self.accounts.get(idx) {
+                        (o.clone(), r.clone())
+                    } else {
+                        self.set_status("Select a repository to clone");
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
             NavigationLevel::Repos { owner, .. } => {
                 let sorted_repos = self.get_sorted_and_filtered_repos(owner);
                 if let Some((_, r)) = sorted_repos.get(self.selected_index()) {
@@ -986,10 +1184,6 @@ impl App {
                 }
             }
             NavigationLevel::Directory { owner, repo, .. } => (owner.clone(), repo.clone()),
-            _ => {
-                self.set_status("Select a repository to clone");
-                return;
-            }
         };
 
         let target_dir = self.start_dir.join(&repo_name);
@@ -1022,6 +1216,16 @@ impl App {
 
     pub fn copy_clone_url(&mut self) {
         let url = match &self.level {
+            NavigationLevel::Accounts => {
+                let indices = self.filtered_account_indices();
+                indices.get(self.selected_index()).and_then(|&idx| {
+                    if let Some(AccountEntry::SavedRepo(o, r)) = self.accounts.get(idx) {
+                        Some(format!("https://github.com/{}/{}.git", o, r))
+                    } else {
+                        None
+                    }
+                })
+            }
             NavigationLevel::Repos { owner, .. } => {
                 let sorted_repos = self.get_sorted_and_filtered_repos(owner);
                 sorted_repos.get(self.selected_index()).map(|(_, r)| r.clone_url.clone())
@@ -1029,7 +1233,6 @@ impl App {
             NavigationLevel::Directory { owner, repo, .. } => {
                 Some(format!("https://github.com/{}/{}.git", owner, repo))
             }
-            _ => None,
         };
 
         if let Some(u) = url {
@@ -1053,7 +1256,11 @@ impl App {
             NavigationLevel::Accounts => {
                 let indices = self.filtered_account_indices();
                 indices.get(self.selected_index()).and_then(|&idx| {
-                    self.accounts.get(idx).map(|acc| format!("https://github.com/{}", acc.name()))
+                    match self.accounts.get(idx) {
+                        Some(AccountEntry::SavedRepo(o, r)) => Some(format!("https://github.com/{}/{}", o, r)),
+                        Some(acc) => Some(format!("https://github.com/{}", acc.name())),
+                        None => None,
+                    }
                 })
             }
             NavigationLevel::Repos { owner, .. } => {
@@ -1096,7 +1303,11 @@ impl App {
             NavigationLevel::Accounts => {
                 let indices = self.filtered_account_indices();
                 indices.get(self.selected_index()).and_then(|&idx| {
-                    self.accounts.get(idx).map(|acc| format!("https://github.com/{}", acc.name()))
+                    match self.accounts.get(idx) {
+                        Some(AccountEntry::SavedRepo(o, r)) => Some(format!("https://github.com/{}/{}", o, r)),
+                        Some(acc) => Some(format!("https://github.com/{}", acc.name())),
+                        None => None,
+                    }
                 })
             }
             NavigationLevel::Repos { owner, .. } => {
@@ -1127,12 +1338,38 @@ impl App {
         }
     }
 
-    pub fn add_custom_user(&mut self, username: String) {
-        let trimmed = username.trim().to_string();
-        if !trimmed.is_empty() && !self.accounts.iter().any(|a| a.name().eq_ignore_ascii_case(&trimmed)) {
-            let insert_pos = if self.accounts.is_empty() { 0 } else { self.accounts.len() - 1 };
+    pub fn add_custom_user_or_repo(&mut self, input: String) {
+        let trimmed = input.trim().to_string();
+        if trimmed.is_empty() {
+            return;
+        }
+
+        // If user entered "owner/repo", treat as a direct repo bookmark
+        if trimmed.contains('/') {
+            let parts: Vec<&str> = trimmed.split('/').collect();
+            if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+                let owner = parts[0].to_string();
+                let repo = parts[1].to_string();
+                if !self.saved_bookmarks.iter().any(|b| b.owner.eq_ignore_ascii_case(&owner) && b.repo.eq_ignore_ascii_case(&repo)) {
+                    self.saved_bookmarks.push(SavedBookmark {
+                        owner: owner.clone(),
+                        repo: repo.clone(),
+                        path: None,
+                        is_file: false,
+                    });
+                    self.rebuild_accounts_list_with_bookmarks();
+                    self.persist_saved_data();
+                    self.set_status(format!("Added saved repo ⭐ {}/{}", owner, repo));
+                }
+                return;
+            }
+        }
+
+        // Otherwise treat as a user or organization handle
+        if !self.accounts.iter().any(|a| a.name().eq_ignore_ascii_case(&trimmed)) {
+            let insert_pos = if self.accounts.is_empty() { 0 } else { self.accounts.len().saturating_sub(1) };
             self.accounts.insert(insert_pos, AccountEntry::Custom(trimmed.clone()));
-            self.persist_saved_accounts();
+            self.persist_saved_data();
             self.set_status(format!("Added and remembered: {}", trimmed));
         }
     }

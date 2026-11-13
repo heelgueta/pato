@@ -1,31 +1,36 @@
 # 🦆 pato
 
-A fast, lightweight GitHub repository and tree explorer TUI with Miller-columns, inspired by `yazi`.
+A fast, lightweight remote GitHub repository, file, and tree explorer TUI with Miller columns, inspired by `yazi`.
 
-Browse your personal accounts, organizations, repositories, directory trees, branches, and code files with syntax highlighting as if they were local directories.
+Browse personal accounts, organizations, repositories, directory trees, branches, code files, and images remotely with zero clone latency.
 
 ---
 
 ## Installation
 
-### From Source
-
-Ensure you have Rust (`cargo`) installed:
+### Quick Install (from Source)
 
 ```bash
 git clone https://github.com/heelgueta/pato.git
 cd pato
 cargo build --release
-cp target/release/pato ~/.local/bin/  # or ~/.cargo/bin/
+install -m 755 target/release/pato ~/.local/bin/pato
+# or: cargo install --path .
 ```
 
-### Authentication
+Make sure `~/.local/bin` (or `~/.cargo/bin`) is in your `$PATH`.
 
-`pato` zero-config authenticates via your existing GitHub CLI setup:
+### Authentication (Zero-Config)
+
+`pato` automatically reads your token from the official GitHub CLI:
 ```bash
 gh auth login
 ```
-Or by setting `export GITHUB_TOKEN="ghp_..."`. If unauthenticated, `pato` still works in public-only mode (60 requests/hour).
+Alternatively, set the standard environment variable:
+```bash
+export GITHUB_TOKEN="ghp_your_personal_access_token"
+```
+*(If unauthenticated, `pato` operates in public-only mode with GitHub's default rate limit of 60 req/h).*
 
 ---
 
@@ -33,30 +38,45 @@ Or by setting `export GITHUB_TOKEN="ghp_..."`. If unauthenticated, `pato` still 
 
 | Key | Action |
 | --- | --- |
-| `h` `j` `k` `l` / Arrows | Navigate list, step into (`l` / `Enter`) or back (`h` / `Backspace`) |
-| `J` / `K` | Scroll preview pane down / up |
-| `b` | **Switch branch** (select from available remote branches) |
+| `h` `j` `k` `l` / Arrows | Navigate list, step into (`l` / `Enter`) or back (`h` / `Backspace` / `Esc`) |
+| `J` / `K` | Scroll preview pane down / up (5 lines) |
+| `#` | **Toggle line numbers** on code files (`ON` / `OFF`) |
+| `m` | **Bookmark / save repository** (adds to `⭐ Saved Repositories` root list) |
+| `r` | **Remove** saved repository or custom user/org from list |
+| `b` | **Switch branch** (choose from available remote branches) |
 | `s` | **Cycle sort mode** (Updated / Created / A-Z / Status / Archived / Fork / Lang) |
-| `c` | **Git clone** repository into launch folder |
+| `c` | **Git clone** repository into current launch folder |
 | `C` (`Shift+c`) | **Copy clone URL** (`.git`) to clipboard |
-| `d` | **Download** selected remote file into launch folder |
+| `d` | **Download** selected remote file into current launch folder |
 | `D` (`Shift+d`) | **Copy web URL** of selected item to clipboard |
-| `r` | **Remove** saved user/org from list |
-| `R` (`Shift+r`) | **Refresh** current level and bypass cache |
-| `u` | Search / explore and auto-remember any public user or organization |
-| `o` | Open selected item in web browser (`xdg-open`) |
-| `/` | Live filter in active list |
-| `?` | Toggle keybindings cheat sheet |
-| `q` / `Esc` | Quit / clear filter / close dialog |
+| `u` | **Explore & Remember**: search/add any user, org, or enter `owner/repo` to bookmark directly |
+| `R` (`Shift+r`) | **Refresh** current view and re-fetch from GitHub |
+| `o` | Open repository, file, or account in web browser |
+| `/` | Live substring / fuzzy filter in active column |
+| `?` | Toggle keybinding cheat sheet |
+| `q` / `Esc` | Quit or close open dialog |
+
+---
+
+## Saved Repositories & Bookmarks
+
+`pato` lets you keep direct references to repositories without needing to navigate via an account or organization:
+
+- **Bookmark on the fly**: Highlight any repository and press `m` to bookmark or unbookmark it.
+- **Direct entry**: Press `u`, type `owner/repo` (e.g. `ratatui/ratatui`), and press `Enter` to bookmark it immediately.
+- **Direct navigation**: Saved repositories appear right at the root accounts column under `⭐ SAVED REPOSITORIES`. Selecting one jumps straight into its directory tree.
+- **Remove saved items**: Press `r` on any saved repository or custom user/org to remove it from your saved list.
+- **Persistent storage**: Saved repositories are stored locally in `~/.config/pato/saved_bookmarks.json`, and remembered users/orgs in `~/.config/pato/saved_accounts.json`.
 
 ---
 
 ## Features
 
-- **Ink Monochrome Theme**: Crisp black-and-white terminal palette (`Border::Double`, clean dark panels).
-- **Yazi-style Cursor Memory**: Returning to a parent directory or repo list preserves your exact previous cursor position.
-- **Auto-Pagination**: Automatically follows GitHub Link headers up to 1,000 repositories so full lists are sorted and filtered accurately.
-- **Terminal Image Previews**: High-resolution 24-bit half-block (`▀`) rendering for `png`, `jpg`, `webp`, `gif`, and `bmp`.
+- **Ink Monochrome Theme**: Crisp black-and-white terminal palette (`#000000` BG, `#f0f0f0` FG, `#828282` DIM, `#1c1c1c` PANEL, `Border::Double`).
+- **Native Markdown Renderer**: Renders READMEs and `.md` files with formatted headers, list bullets, blockquotes, and fenced code blocks.
+- **Code Preview & Line Numbers**: Syntax highlighting via `syntect`, top metadata summary bar (`lines`, `size`, `syntax`), and toggleable line numbers (`#`).
+- **Terminal Image Previews**: 24-bit half-block (`▀`) graphics preview for PNG, JPEG, WEBP, GIF, and BMP files.
+- **Branch Switcher**: Seamlessly query remote branches with `b` and switch trees on the fly.
+- **Yazi-style Cursor Memory**: Returning to parent folders or repo lists preserves your exact previous cursor position.
+- **Auto-Pagination**: Automatically follows RFC 5988 Link headers up to 1,000 repositories so full lists are sorted and filtered accurately.
 - **Live Rate-Limit Badge**: Displays live `API: <remaining>/<limit>` in header, warning when running low.
-- **Auto-Remembered Accounts**: Discovered users/orgs persist in `~/.config/pato/saved_accounts.json`.
-- **In-Pane Human Errors**: Friendly error messages inside panes with instant retry (`R`).
